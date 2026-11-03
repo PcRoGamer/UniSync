@@ -2,64 +2,85 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+
 import pytest
 
-from unisync.core.download_registry import (
-    DownloadRegistry,
-    DownloadItem,
-    resolve_item,
-    register_download,
-)
+from unisync.core.download_registry import DownloadRegistry
 
 
-def test_registry_loads_existing_items() -> None:
-    reg = DownloadRegistry.get_instance()
-    items = reg.list_all()
-    assert len(items) >= 390
+@pytest.fixture
+def registry(tmp_path: Path) -> DownloadRegistry:
+    manifest = tmp_path / "downloads_manifest.json"
+    reg = DownloadRegistry(manifest)
+
+    canvas_file = tmp_path / "banner-blaw10001-1.png"
+    canvas_file.write_bytes(b"png-fixture")
+    reg.register(
+        platform="canvas",
+        item_id="26804961",
+        title="banner-blaw10001-1.png",
+        direct_link="https://canvas.lms.unimelb.edu.au/courses/240718/files/26804961/download?download_frd=1",
+        local_filepath=canvas_file,
+        course_id="240718",
+        course_name="BLAW10001",
+        content_type="image/png",
+    )
+
+    subtitle = tmp_path / "lecture-fixture.vtt"
+    subtitle.write_text("WEBVTT\n", encoding="utf-8")
+    reg.register(
+        platform="echo360",
+        item_id="lecture-fixture:subtitles",
+        title="lecture-fixture.vtt",
+        direct_link="https://echo360.net.au/media/download/lecture-fixture/transcript.vtt",
+        local_filepath=subtitle,
+        course_id="echo-course",
+        course_name="COMP10001",
+        content_type="text/vtt",
+    )
+    return reg
 
 
-def test_resolve_by_bare_filename() -> None:
-    # Query by bare filename
-    item = resolve_item("banner-blaw10001-1.png")
+def test_registry_loads_existing_items(registry: DownloadRegistry) -> None:
+    reloaded = DownloadRegistry(registry._data_path)
+    assert len(reloaded.list_all()) == 2
+
+
+def test_resolve_by_bare_filename(registry: DownloadRegistry) -> None:
+    item = registry.resolve("banner-blaw10001-1.png")
     assert item is not None
     assert item.platform == "canvas"
-    assert "240718" in item.course_id
+    assert item.course_id == "240718"
     assert "download_frd=1" in item.direct_link
     assert item.title == "banner-blaw10001-1.png"
 
 
-def test_resolve_by_direct_link() -> None:
+def test_resolve_by_direct_link(registry: DownloadRegistry) -> None:
     url = "https://canvas.lms.unimelb.edu.au/courses/240718/files/26804961/download?download_frd=1"
-    item = resolve_item(url)
+    item = registry.resolve(url)
     assert item is not None
     assert item.item_id == "26804961"
     assert "banner-blaw10001-1.png" in item.local_filepath
 
 
-def test_resolve_by_item_id() -> None:
-    item = resolve_item("26804961")
+def test_resolve_by_item_id(registry: DownloadRegistry) -> None:
+    item = registry.resolve("26804961")
     assert item is not None
     assert item.title == "banner-blaw10001-1.png"
 
 
-def test_resolve_echo360_subtitle() -> None:
-    item = resolve_item("G_065eec77-13b6-455c-a044-9111057cc197_5645c5ef-f457-430f-939a-6415f263ba6a_2026-07-30T16_05_00.000_2026-07-30T17_00_00.000.vtt")
+def test_resolve_echo360_subtitle(registry: DownloadRegistry) -> None:
+    item = registry.resolve("lecture-fixture.vtt")
     assert item is not None
     assert item.platform == "echo360"
-    assert any(d in item.direct_link for d in ("echo360.net.au", "echo360.org.au"))
+    assert "echo360.net.au" in item.direct_link
 
 
-def test_instant_lookup_benchmark() -> None:
-    """Benchmark 1,000 lookups to guarantee O(1) sub-millisecond performance for AI agents/ingestion."""
-    reg = DownloadRegistry.get_instance()
-    queries = ["banner-blaw10001-1.png", "26804961", "canvas-downloader", "non-existent-file.pdf"]
-
+def test_instant_lookup_benchmark(registry: DownloadRegistry) -> None:
+    queries = ["banner-blaw10001-1.png", "26804961", "lecture-fixture.vtt", "non-existent-file.pdf"]
     t0 = time.perf_counter()
     for _ in range(250):
-        for q in queries:
-            reg.resolve(q)
+        for query in queries:
+            registry.resolve(query)
     elapsed_ms = (time.perf_counter() - t0) * 1000
-
-    # 1,000 lookups should take well under 1500ms total (<1.5ms per lookup)
     assert elapsed_ms < 1500.0, f"1000 lookups took {elapsed_ms:.2f}ms"
-

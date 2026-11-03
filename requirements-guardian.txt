@@ -1,0 +1,12 @@
+# Minimal dependency set for Guardian's managed UniSync HTTP service.
+# Keep this lean: Guardian does not need UniSync's MCP/RAG/document extras by default.
+fastapi>=0.100.0
+uvicorn>=0.20.0
+websockets>=12.0
+httpx>=0.25.0
+pydantic>=2.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+python-multipart>=0.0.6
+anyio>=4.0.0
+camoufox==0.5.9

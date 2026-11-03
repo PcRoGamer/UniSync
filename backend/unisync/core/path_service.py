@@ -40,11 +40,22 @@ class PathService:
             if (cand / "backend" / "unisync").exists():
                 self.project_root = cand
             else:
-                self.project_root = Path(r"c:\Users\Admin\Desktop\UniSync")
+                # Last-resort source root for unusual embedding layouts. Never
+                # bake a developer-specific absolute path into the package.
+                self.project_root = Path.cwd().resolve()
         else:
             self.project_root = Path(project_root)
 
-        self.data_root = self.project_root / "data"
+        # Guardian and other packaged hosts must keep mutable university state out
+        # of the application/resources directory. Honour the explicit runtime data
+        # root when provided; source checkouts retain the traditional <repo>/data
+        # layout for standalone UniSync development.
+        configured_data_root = os.environ.get("UNISYNC_DATA_DIR")
+        self.data_root = (
+            Path(configured_data_root).expanduser().resolve()
+            if configured_data_root
+            else self.project_root / "data"
+        )
         self._ensure_dirs()
 
     def _ensure_dirs(self) -> None:

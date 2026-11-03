@@ -20,28 +20,34 @@ from unisync.mcp.server import (
 
 
 def test_unisync_notebooklm_list_notebooks() -> None:
-    """Verify listing provisioned subject notebooks returns valid JSON schema."""
+    """Verify listing notebooks returns a self-consistent schema on fresh or synced installs."""
     raw = unisync_notebooklm_list_notebooks()
     data = json.loads(raw)
     assert isinstance(data, dict)
     assert "auth" in data
     assert "courses" in data
-    assert data["total_courses"] >= 4
-    codes = [c["course_code"] for c in data["courses"]]
-    assert "BLAW10001" in codes
-    assert "COMP10001" in codes
-    assert "INFO10003" in codes
-    assert "CCDP10003" in codes
+    assert isinstance(data["courses"], list)
+    assert data["total_courses"] == len(data["courses"])
+    for course in data["courses"]:
+        assert "course_code" in course
 
 
 def test_resolve_notebooklm_course() -> None:
-    """Verify course resolution handles case-insensitivity and raises on unknown course."""
-    blaw = _resolve_notebooklm_course("blaw10001")
-    assert blaw["course_code"] == "BLAW10001"
-    assert "notebook_id" in blaw
-
-    with pytest.raises(ValueError, match="No provisioned NotebookLM notebook found"):
-        _resolve_notebooklm_course("INVALID99999")
+    """Verify course resolution independently of the developer's synced subjects."""
+    state = {
+        "notebooks": {
+            "BLAW10001": {
+                "course_code": "BLAW10001",
+                "notebook_id": "fixture-notebook",
+            }
+        }
+    }
+    with patch("unisync.services.notebooklm.state.load_sync_state", return_value=state):
+        blaw = _resolve_notebooklm_course("blaw10001")
+        assert blaw["course_code"] == "BLAW10001"
+        assert blaw["notebook_id"] == "fixture-notebook"
+        with pytest.raises(ValueError, match="No provisioned NotebookLM notebook found"):
+            _resolve_notebooklm_course("INVALID99999")
 
 
 @pytest.mark.asyncio

@@ -1093,11 +1093,21 @@ def unisync_search_lectures(
         vtt_dir = Path("data/cache/echo360_subtitles")
 
     if not vtt_dir.exists():
-        return json.dumps({"error": "No lecture transcripts found in subtitles cache."})
+        return json.dumps({
+            "query": query,
+            "total_lectures_matched": 0,
+            "results": [],
+            "note": "No lecture transcript cache exists yet.",
+        })
 
     vtt_files = list(vtt_dir.glob("*.vtt"))
     if not vtt_files:
-        return json.dumps({"matches": [], "total_matches": 0, "note": "No downloaded subtitle files found."})
+        return json.dumps({
+            "query": query,
+            "total_lectures_matched": 0,
+            "results": [],
+            "note": "No downloaded subtitle files found.",
+        })
 
     terms = [t.lower() for t in query.split() if t.strip()]
     matches = []

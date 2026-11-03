@@ -15,8 +15,8 @@ if !ERRORLEVEL! equ 0 (
 )
 
 echo Starting server...
-cd /d "C:\Users\Admin\Desktop\UniSync"
-set "PYTHONPATH=C:\Users\Admin\Desktop\UniSync\backend"
+cd /d "%~dp0"
+set "PYTHONPATH=C:\Users\Admin\AppData\Local\npm-cache\_npx\4b4c857f6efdfb61\node_modules\@wonderwhy-er\desktop-commander\dist\backend"
 
 start "UniSync Server" /min "!PYTHON_EXE!" -m uvicorn unisync.api.main:app --host 127.0.0.1 --port 8000
 
