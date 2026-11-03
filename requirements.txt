@@ -1,0 +1,23 @@
+# UniSync Core & API
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+httpx>=0.25.0
+pydantic>=2.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+python-multipart>=0.0.6
+anyio>=4.0.0
+camoufox>=0.5.0
+
+# Model Context Protocol (MCP) Server for AI Agents
+mcp>=1.0.0,<2.0.0
+
+# Document & Slide Extraction (PDF, DOCX, PPTX)
+pypdf>=3.0.0
+python-docx>=1.0.0
+python-pptx>=0.6.0
+
+# Local Hybrid Knowledge Base & Two-Stage Reranking (Zero Cloud Costs)
+txtai>=7.0.0
+faiss-cpu>=1.7.4
+flashrank>=0.2.0

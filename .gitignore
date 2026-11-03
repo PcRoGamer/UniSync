@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / frontend
+node_modules/
+.next/
+out/
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# UniSync runtime state and user data
+# This can contain Canvas sessions, signed URLs, course metadata, downloaded
+# lecture/course files, email state, browser profiles and local settings.
+data/
+backend/data/
+
+# Local agent/dev-tool state
+.agents/
+.freebuff/
+
+# Runtime/debug output
+*.log
+*.pid
+*.tmp
+*.bak
+screenshot*.png
+native_probe*.log
+server_*.log
+launcher_debug.log
+
+# OS/editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/

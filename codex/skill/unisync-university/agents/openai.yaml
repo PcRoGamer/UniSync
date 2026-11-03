@@ -1,0 +1,4 @@
+interface:
+  display_name: "UniSync University Assistant"
+  short_description: "Connect UniMelb courses and lecture tools"
+  default_prompt: "Use UniSync for this university-related task: start its local MCP server, connect through the active UniMelb browser session, and use the available tools."

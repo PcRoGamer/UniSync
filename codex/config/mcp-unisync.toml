@@ -1,0 +1,10 @@
+# Merge this configuration block into ~/.codex/config.toml
+# Replace /Users/YOUR_USERNAME/UniSync with the absolute path to your UniSync extraction directory.
+
+[mcp_servers.unisync]
+command = "/Users/YOUR_USERNAME/UniSync/run_mcp.sh"
+# On Windows, use: command = "python", args = ["-m", "unisync.mcp"]
+startup_timeout_sec = 120
+tool_timeout_sec = 120
+enabled = true
+default_tools_approval_mode = "prompt"
