@@ -141,7 +141,9 @@ class EmailMonitorStore:
                 try:
                     entry = json.loads(line)
                     lid = entry.get("ledger_id")
-                    if lid:
+                    # Failed archive attempts must be retried, not permanently
+                    # marked as processed just because an error was logged.
+                    if lid and entry.get("status") in ("processed", "skipped_no_action"):
                         ids.add(lid)
                 except json.JSONDecodeError:
                     continue
@@ -158,7 +160,8 @@ class EmailMonitorStore:
             f.write(entry.model_dump_json() + "\n")
         # Load processed IDs into memory and add the new one
         ids = self._load_processed_ids()
-        ids.add(entry.ledger_id)
+        if entry.status in ("processed", "skipped_no_action"):
+            ids.add(entry.ledger_id)
 
     def get_ledger_entries(self, limit: int = 100) -> list[LedgerEntry]:
         """Return the most recent *limit* ledger entries."""
