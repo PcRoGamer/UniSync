@@ -330,13 +330,28 @@ class EmailMonitorService:
                 if msg.attachments:
                     att_dir = msg_dir / "attachments"
                     att_dir.mkdir(parents=True, exist_ok=True)
-                    for att in msg.attachments:
-                        att_path = att_dir / att.filename
-                        if att.content:
+                    for att_index, att in enumerate(msg.attachments):
+                        # MIME filenames are attacker-controlled. Normalise both
+                        # Windows and POSIX separators before touching the disk.
+                        source_name = str(att.filename or "").replace("\\\\", "/").replace("\\", "/")
+                        safe_name = source_name.rsplit("/", 1)[-1]
+                        safe_name = re.sub(r'[<>:"|?*\\x00-\\x1f]', "_", safe_name).strip(" .")
+                        if not safe_name or safe_name in (".", ".."):
+                            safe_name = "attachment"
+                        # Preserve multiple same-name attachments without overwrite.
+                        candidate = safe_name
+                        suffix = 2
+                        while (att_dir / candidate).exists():
+                            stem, ext = Path(safe_name).stem, Path(safe_name).suffix
+                            candidate = f"{stem}_{suffix}{ext}"
+                            suffix += 1
+                        att_path = att_dir / candidate
+                        if att.content is not None:
                             att_path.write_bytes(att.content)
                         att.local_filepath = str(att_path)
                         saved_atts.append({
-                            "filename": att.filename,
+                            "filename": candidate,
+                            "original_filename": str(att.filename),
                             "content_type": att.content_type,
                             "size_bytes": att.size_bytes,
                             "local_filepath": str(att_path),
@@ -345,8 +360,8 @@ class EmailMonitorService:
                         # Register attachment in UniSync DownloadRegistry
                         download_registry.register(
                             platform="email",
-                            item_id=f"email:{msg.uid}:{att.filename}",
-                            title=f"{att.filename} (Email: {msg.subject[:30]})",
+                            item_id=f"email:{msg.uid}:attachment:{att_index}",
+                            title=f"{candidate} (Email: {msg.subject[:30]})",
                             direct_link=f"mailbox://{username}/{mailbox}#{msg.uid}?attachment={att.filename}",
                             local_filepath=att_path,
                             course_id="email",
