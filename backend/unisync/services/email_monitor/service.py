@@ -333,9 +333,9 @@ class EmailMonitorService:
                     for att_index, att in enumerate(msg.attachments):
                         # MIME filenames are attacker-controlled. Normalise both
                         # Windows and POSIX separators before touching the disk.
-                        source_name = str(att.filename or "").replace("\\\\", "/").replace("\\", "/")
+                        source_name = str(att.filename or "").replace("\\", "/")
                         safe_name = source_name.rsplit("/", 1)[-1]
-                        safe_name = re.sub(r'[<>:"|?*\\x00-\\x1f]', "_", safe_name).strip(" .")
+                        safe_name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", safe_name).strip(" .")
                         if not safe_name or safe_name in (".", ".."):
                             safe_name = "attachment"
                         # Preserve multiple same-name attachments without overwrite.
