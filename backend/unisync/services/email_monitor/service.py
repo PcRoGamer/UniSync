@@ -91,6 +91,10 @@ class EmailMonitorService:
             mailbox="INBOX",
             source_label="thunderbird_profile",
         )
+        # Advance the Thunderbird source cursor only after every message was
+        # archived. A failed disk write must be retried on the next sync.
+        if ingest_res.get("success"):
+            self.store.save_cursor(new_cursor)
         return {
             "success": True,
             "inbox_path": str(inbox_path),
@@ -240,13 +244,18 @@ class EmailMonitorService:
         result["attachments_downloaded"] = ingest_res.get("attachments_count", 0)
         result["errors"].extend(ingest_res.get("errors", []))
 
-        # Save cursor
-        new_cursor.last_poll_at = time.time()
-        self.store.save_cursor(new_cursor)
+        # Never advance the server UID cursor across an unarchived message.
+        # Otherwise archive errors become permanent, invisible search gaps.
+        if ingest_res.get("success"):
+            new_cursor.last_poll_at = time.time()
+            self.store.save_cursor(new_cursor)
+            self._last_error = None
+        else:
+            result["success"] = False
+            self._last_error = "Email archive failure: " + "; ".join(result["errors"][:3])
 
         # Update service state
         self._last_poll_at = time.time()
-        self._last_error = None
         self._poll_count += 1
 
         return result
