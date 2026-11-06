@@ -1751,7 +1751,18 @@ def unisync_search(
     except Exception as _e:
         logger.debug("unisync_search announcements lookup error: %s", _e)
 
-    # 5. Semantic Passages via Knowledge Base
+    # 5. Full email archive via SQLite FTS5 (all archived entries; no LLM)
+    matched_emails: list[dict[str, Any]] = []
+    email_archive_total: int = 0
+    try:
+        email_query = f"{query} {course}".strip() if course else query
+        mail_result = json.loads(unisync_search_emails(query=email_query, limit=limit))
+        matched_emails = mail_result.get("emails", [])
+        email_archive_total = int(mail_result.get("total_matched", 0))
+    except Exception as _e:
+        logger.debug("unisync_search archived email lookup error: %s", _e)
+
+    # 6. Semantic Passages via Knowledge Base
     matched_passages: list[dict[str, Any]] = []
     try:
         from unisync.services.kb import get_kb_service
@@ -1776,6 +1787,7 @@ def unisync_search(
         + len(matched_lectures)
         + len(matched_announcements)
         + len(matched_passages)
+        + len(matched_emails)
     )
 
     return json.dumps({
@@ -1787,6 +1799,8 @@ def unisync_search(
             "materials": matched_materials,
             "lectures": matched_lectures,
             "announcements": matched_announcements,
+            "emails": matched_emails,
+            "email_archive_total_matched": email_archive_total,
             "semantic_passages": matched_passages,
         },
     }, indent=2)
