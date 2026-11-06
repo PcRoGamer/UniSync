@@ -1,0 +1,32 @@
+name: Archived email retrieval tests
+
+on:
+  push:
+    branches:
+      - feature/mcp-email-archive-retrieval-20261106
+  pull_request:
+    paths:
+      - 'backend/unisync/services/email_monitor/archive_search.py'
+      - 'backend/tests/test_mcp_email_archive.py'
+      - 'backend/unisync/mcp/server.py'
+      - '.github/workflows/email-archive-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  email-archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify modules compile
+        run: |
+          python -m py_compile backend/unisync/services/email_monitor/archive_search.py backend/unisync/mcp/server.py backend/tests/test_mcp_email_archive.py
+      - name: Run offline mailbox retrieval tests (no network, no LLM)
+        run: |
+          python -m unittest discover -s backend/tests -p 'test_mcp_email_archive.py' -v
