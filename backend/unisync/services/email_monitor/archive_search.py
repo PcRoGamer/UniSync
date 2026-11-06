@@ -9,11 +9,25 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from html import unescape
 from pathlib import Path
 from typing import Any
+
+
+
+def _display_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return ", ".join(_display_text(part) for part in value)
+    if isinstance(value, dict):
+        return _display_text(value.get("address") or value.get("emailAddress") or value.get("name"))
+    return str(value)
 
 
 class EmailArchive:
@@ -70,62 +84,97 @@ class EmailArchive:
         return ""
 
     def sync(self, db: sqlite3.Connection) -> None:
-        """Incremental by ledger fingerprint; never re-extract unchanged emails."""
+        """Index only complete newly appended JSONL records.
+
+        A truncated or same-sized replaced ledger rebuilds the index. A partially
+        written final line is reconsidered on the next query rather than lost.
+        """
         if not self.ledger.is_file():
             return
         st = self.ledger.stat()
         signature = f"{st.st_size}:{st.st_mtime_ns}"
-        row = db.execute("SELECT value FROM settings WHERE key='ledger_signature'").fetchone()
-        if row and row[0] == signature:
+        old = db.execute("SELECT value FROM settings WHERE key='ledger_signature'").fetchone()
+        if old and old[0] == signature:
             return
+
         with db:
-            # The ledger is append-only; indexed IDs are not re-read from disk.
-            # A replaced/truncated ledger must not silently retain missing rows.
-            previous = db.execute("SELECT value FROM settings WHERE key='ledger_size'").fetchone()
-            if previous and st.st_size < int(previous[0]):
+            row = db.execute("SELECT value FROM settings WHERE key='ledger_size'").fetchone()
+            previous = int(row[0]) if row else 0
+            reset = st.st_size < previous or (st.st_size == previous and
+                       bool(old and old[0] != signature))
+            if reset or not previous:
                 db.execute("DELETE FROM email_fts")
                 db.execute("DELETE FROM emails")
-            with self.ledger.open("r", encoding="utf-8", errors="replace") as stream:
-                for line in stream:
+                previous = 0
+
+            # Binary cursor offsets remain correct with UTF-8, including CRLF
+            # and non-ASCII message metadata.
+            with self.ledger.open("rb") as stream:
+                stream.seek(previous)
+                while True:
+                    line_start = stream.tell()
+                    line = stream.readline()
+                    if not line:
+                        break
+                    if not line.endswith(b"\n"):
+                        stream.seek(line_start)
+                        break
                     try:
                         item = json.loads(line)
-                    except (ValueError, TypeError):
+                    except (UnicodeDecodeError, ValueError, TypeError):
+                        continue
+                    if not isinstance(item, dict):
                         continue
                     if item.get("status") != "processed" or not isinstance(item.get("ledger_id"), str):
                         continue
                     ident = item["ledger_id"]
-                    if db.execute("SELECT 1 FROM emails WHERE id=?", (ident,)).fetchone():
+                    if not ident or len(ident) > 512 or db.execute(
+                        "SELECT 1 FROM emails WHERE id=?", (ident,)
+                    ).fetchone():
                         continue
                     folder = self._trusted_archive(item.get("archived_path"))
                     if not folder:
                         continue
+
+                    db.execute("SAVEPOINT email_index_record")
                     try:
                         meta_file = folder / "metadata.json"
                         meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.is_file() else {}
                         if not isinstance(meta, dict):
                             meta = {}
-                        attachments = meta.get("attachments") or []
+                        attachments = meta.get("attachments")
                         if not isinstance(attachments, list):
                             attachments = []
-                        names = " ".join(str(a.get("filename", "")) for a in attachments if isinstance(a, dict))
-                        subject = str(meta.get("subject") or item.get("subject") or "")
-                        sender = str(meta.get("from") or "")
-                        recipients = " ".join(str(x) for x in (meta.get("to") or []) + (meta.get("cc") or []))
+                            meta["attachments"] = []
+                        names = " ".join(_display_text(a.get("filename")) for a in attachments if isinstance(a, dict))
+                        subject = _display_text(meta.get("subject") or item.get("subject"))
+                        sender = _display_text(meta.get("from"))
+                        recipients = _display_text(meta.get("to")) + " " + _display_text(meta.get("cc"))
+                        received = _display_text(meta.get("date"))
+                        processed_at = float(item.get("processed_at") or 0)
+                        if not received and processed_at:
+                            received = datetime.fromtimestamp(processed_at, tz=timezone.utc).isoformat()
                         body = self._body(folder)
-                        data = (ident, str(folder), subject, sender, recipients,
-                                str(meta.get("date") or ""), float(item.get("processed_at") or 0),
-                                body, json.dumps(meta, ensure_ascii=False), names)
                         db.execute("""INSERT INTO emails
                             (id,archive_path,subject,sender,recipients,sent_at,processed_at,body,meta,attachment_names)
-                            VALUES (?,?,?,?,?,?,?,?,?,?)""", data)
-                        rowid = db.execute("SELECT rowid FROM emails WHERE id=?", (ident,)).fetchone()[0]
-                        db.execute("""INSERT INTO email_fts(rowid,subject,sender,recipients,body,attachment_names)
-                            VALUES(?,?,?,?,?,?)""", (rowid, subject, sender, recipients, body, names))
+                            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                            (ident,str(folder),subject,sender,recipients,received,processed_at,
+                             body,json.dumps(meta,ensure_ascii=False),names))
+                        rid = db.execute("SELECT rowid FROM emails WHERE id=?", (ident,)).fetchone()[0]
+                        db.execute("""INSERT INTO email_fts
+                            (rowid,subject,sender,recipients,body,attachment_names)
+                            VALUES(?,?,?,?,?,?)""", (rid,subject,sender,recipients,body,names))
+                        db.execute("RELEASE SAVEPOINT email_index_record")
                     except (OSError, ValueError, TypeError, sqlite3.Error):
-                        # Malformed historical records must not hide the rest of the mailbox.
+                        db.execute("ROLLBACK TO SAVEPOINT email_index_record")
+                        db.execute("RELEASE SAVEPOINT email_index_record")
                         continue
-            db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('ledger_size',?)", (str(st.st_size),))
-            db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('ledger_signature',?)", (signature,))
+                complete_offset = stream.tell()
+            for key, value in (
+                ("ledger_size",str(complete_offset)),
+                ("ledger_signature",signature if complete_offset == st.st_size else "incomplete"),
+            ):
+                db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (key,value))
 
     @staticmethod
     def _match_expression(query: str) -> str:
