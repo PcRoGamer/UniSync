@@ -1,5 +1,5 @@
 """Keep lifecycle tests isolated from the user's live university session."""
-from importlib.util import find_spec
+from importlib import import_module
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -7,11 +7,14 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolate_browser_maintenance():
-    # Older/standalone UniSync checkouts do not ship the optional browser
-    # module. Do not let the global fixture invalidate unrelated email tests.
-    if find_spec("unisync.api.browser") is None:
+    # In lightweight CI, the optional Camoufox/browser runtime may exist as a
+    # source file but fail import because browser dependencies are not installed.
+    # Email-only tests must not depend on that optional component.
+    try:
+        browser = import_module("unisync.api.browser")
+    except ImportError:
         yield
         return
-    with patch('unisync.api.browser.maintain_canvas_session', new_callable=AsyncMock), \
-         patch('unisync.api.browser.shutdown_browser', new_callable=AsyncMock):
+    with patch.object(browser, "maintain_canvas_session", new_callable=AsyncMock), \
+         patch.object(browser, "shutdown_browser", new_callable=AsyncMock):
         yield
