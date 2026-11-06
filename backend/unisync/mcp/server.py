@@ -208,6 +208,33 @@ def unisync_search_emails(
 
 
 @mcp.tool()
+def unisync_get_email_sync_status() -> str:
+    """Report whether email polling is configured and the archived-message count.
+
+    A healthy MCP tunnel is not proof of a connected mailbox. Distinguishes an
+    absent local archive from a verified empty search, without AI calls.
+    """
+    try:
+        from unisync.services.email_monitor.service import get_email_monitor_service
+        archive = _unisync_email_archive()
+        status = get_email_monitor_service().get_status()
+        result = archive.search("", limit=1)
+        return json.dumps({
+            "archive_available": archive.ledger.is_file(),
+            "archived_indexed_count": result["total_matched"],
+            "poll_enabled": status.get("enabled", False),
+            "consent_granted": status.get("consent_granted", False),
+            "poll_running": status.get("running", False),
+            "last_poll_at": status.get("last_poll_at"),
+            "last_error": status.get("last_error"),
+            "cursor": status.get("cursor"),
+            "note": "Archived count is not the mailbox total. Historical backfill and connector health must be checked separately.",
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": f"Email sync status unavailable: {exc}"})
+
+
+@mcp.tool()
 def unisync_get_email(email_id: str, offset: int = 0, max_chars: int = 12000,
                       format: str = "text") -> str:
     """Retrieve an original archived email by ID returned by unisync_search_emails.
