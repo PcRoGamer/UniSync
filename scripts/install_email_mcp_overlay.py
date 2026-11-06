@@ -1,4 +1,4 @@
-"""Safely overlay the email retrieval MCP tools onto a newer local UniSync checkout.
+r"""Safely overlay the email retrieval MCP tools onto a newer local UniSync checkout.
 
 The GitHub branch may be older than the running UniSync code. NEVER overwrite
 the target server wholesale. Copy only the new index module and add the new
