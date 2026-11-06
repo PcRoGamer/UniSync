@@ -29,6 +29,8 @@ jobs:
           python -m py_compile backend/unisync/services/email_monitor/archive_search.py backend/unisync/mcp/server.py backend/tests/test_mcp_email_archive.py
       - name: Install minimal MCP runtime for registration smoke check
         run: python -m pip install 'mcp>=1,<2' 'pydantic>=2'
+      - name: Install testing tools (no LLM clients invoked)
+        run: python -m pip install 'pytest>=8' 'pytest-asyncio>=0.23'
       - name: Validate MCP tool registration without calling any tools
         env:
           PYTHONPATH: backend
@@ -40,6 +42,11 @@ jobs:
           assert expected.issubset(found), f'Missing MCP tools: {sorted(expected - found)}'
           print(f'All four email retrieval tools registered: {sorted(expected)}')
           PY
+      - name: Recheck existing email connector and archive regressions
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest -q backend/tests/services/email_monitor
       - name: Run source durability tests (no network, no LLM)
         env:
           PYTHONPATH: backend
