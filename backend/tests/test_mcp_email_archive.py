@@ -4,8 +4,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from unisync.services.email_monitor.archive_search import EmailArchive
+# Load the zero-dependency archive module directly: the parent email_monitor
+# package imports optional production services unrelated to this offline test.
+import importlib.util
+archive_path = Path(__file__).resolve().parents[1] / "unisync" / "services" / "email_monitor" / "archive_search.py"
+spec = importlib.util.spec_from_file_location("unisync_test_archive", archive_path)
+assert spec and spec.loader
+archive_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(archive_module)
+EmailArchive = archive_module.EmailArchive
 
 
 class EmailArchiveTest(unittest.TestCase):
