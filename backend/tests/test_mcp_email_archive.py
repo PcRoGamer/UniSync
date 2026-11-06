@@ -89,4 +89,48 @@ class EmailArchiveTest(unittest.TestCase):
         self.assertEqual(archive.search('exam')['total_matched'],0)
         self.assertIn('not found',archive.get('account:message1')['error'].lower())
 
+
+    def test_does_not_scan_partial_jsonl_record_until_complete(self):
+        self.add(0)
+        archive = EmailArchive(self.ledger, self.emails)
+        self.assertEqual(archive.search('exam')['total_matched'], 1)
+        folder = self.emails / 'msg1'
+        folder.mkdir()
+        (folder / 'body.txt').write_text('critical meeting postponed')
+        (folder / 'metadata.json').write_text(json.dumps({'subject':'Revised meeting','from':'tutor@example.edu'}))
+        entry = json.dumps({'ledger_id':'account:message1','archived_path':str(folder),
+                            'subject':'Revised meeting','status':'processed','processed_at':123})
+        with self.ledger.open('ab') as out:
+            out.write(entry.encode())
+        self.assertEqual(archive.search('critical')['total_matched'], 0)
+        with self.ledger.open('ab') as out:
+            out.write(b'\n')
+        self.assertEqual(archive.search('critical')['total_matched'], 1)
+
+    def test_truncated_ledger_rebuilds_without_ghost_messages(self):
+        self.add(0)
+        self.add(1)
+        archive = EmailArchive(self.ledger, self.emails)
+        self.assertEqual(archive.search()['total_matched'], 2)
+        self.ledger.write_text(json.dumps(self.items[0]) + '\n')
+        self.assertEqual(archive.search()['total_matched'], 1)
+
+    def test_fts_operators_are_not_executable_query_syntax(self):
+        self.add(0, body='"exam" OR OR 123 COMP10001')
+        archive = EmailArchive(self.ledger, self.emails)
+        for query in ['exam OR', '"exam"', 'COMP10001', 'exam NOT']:
+            self.assertIn('emails', archive.search(query))
+        self.assertEqual(archive.search('no-such-needle')['total_matched'], 0)
+
+    def test_single_string_recipients_do_not_drop_archived_email(self):
+        self.add(0, body='Important policy reminder')
+        folder = self.emails / 'msg0'
+        metadata = json.loads((folder / 'metadata.json').read_text())
+        metadata.update({'to':'student@example.edu','cc':None,'from':{'name':'Prof'}})
+        (folder / 'metadata.json').write_text(json.dumps(metadata))
+        archive = EmailArchive(self.ledger, self.emails)
+        self.assertEqual(archive.search('reminder')['total_matched'], 1)
+        self.assertEqual(archive.get('account:message0')['from'], 'Prof')
+
+
 if __name__=='__main__':unittest.main()
