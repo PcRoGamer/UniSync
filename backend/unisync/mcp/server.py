@@ -1961,6 +1961,10 @@ async def unisync_notebooklm_add_note(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Optional host operations: all require short-lived approval granted on this PC.
+from unisync.mcp.workstation import register_workstation_tools
+register_workstation_tools(mcp)
+
 # Server Execution & Protocol Negotiation Wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
