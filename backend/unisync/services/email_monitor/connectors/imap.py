@@ -149,12 +149,18 @@ class ImapConnector:
                 if status == "OK":
                     uidvalidity = self._get_uidvalidity(data)
 
-            # Search for UIDs after the cursor
-            search_uid = cursor.last_uid + 1
+            # IMAP UIDs are only stable within one UIDVALIDITY epoch. Reset
+            # the range on mailbox recreation rather than silently missing mail.
+            validity_changed = (
+                uidvalidity is not None and cursor.uidvalidity is not None
+                and uidvalidity != cursor.uidvalidity
+            )
+            prior_uid = 0 if validity_changed else cursor.last_uid
+            search_uid = prior_uid + 1
             status, data = client.uid("SEARCH", None, f"UID {search_uid}:*")
             if status != "OK" or not data or not data[0]:
                 return messages, MailCursor(
-                    last_uid=cursor.last_uid,
+                    last_uid=prior_uid,
                     last_poll_at=time.time(),
                     uidvalidity=uidvalidity or cursor.uidvalidity,
                 )
@@ -162,17 +168,21 @@ class ImapConnector:
             uid_list = data[0].split()
             for imap_uid in uid_list:
                 uid_str = imap_uid.decode("utf-8", errors="ignore") if isinstance(imap_uid, bytes) else str(imap_uid)
+                # Some IMAP servers treat UID n:* as including the current last
+                # item even when n is beyond the mailbox's highest UID.
+                if not uid_str.isdigit() or int(uid_str) <= prior_uid:
+                    continue
 
                 # Determine fetch mode
                 fetch_cmd = "(BODY.PEEK[] FLAGS)" if not self._mark_seen else "(BODY[] FLAGS)"
 
                 status, fetched = client.uid("FETCH", imap_uid, fetch_cmd)
                 if status != "OK" or not fetched:
-                    continue
+                    raise ConnectionError(f"IMAP FETCH failed for UID {uid_str}; cursor not advanced")
 
                 raw_bytes = self._extract_message_bytes(fetched)
                 if raw_bytes is None:
-                    continue
+                    raise ValueError(f"Empty IMAP message for UID {uid_str}; cursor not advanced")
 
                 msg = self._parse_fetched_message(raw_bytes, uid_str)
                 messages.append(msg)
@@ -180,7 +190,7 @@ class ImapConnector:
             # Build new cursor
             new_uid = max(
                 (int(m.uid) for m in messages),
-                default=cursor.last_uid,
+                default=prior_uid,
             )
             new_cursor = MailCursor(
                 last_uid=new_uid,

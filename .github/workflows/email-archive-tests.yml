@@ -1,0 +1,59 @@
+name: Archived email retrieval tests
+
+on:
+  push:
+    branches:
+      - feature/mcp-email-archive-retrieval-20261106
+  pull_request:
+    paths:
+      - 'backend/unisync/services/email_monitor/archive_search.py'
+      - 'backend/tests/test_mcp_email_archive.py backend/tests/test_email_source_durability.py backend/tests/test_email_overlay_install.py scripts/install_email_mcp_overlay.py'
+      - 'backend/unisync/mcp/server.py'
+      - '.github/workflows/email-archive-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  email-archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify modules compile
+        run: |
+          python -m py_compile backend/unisync/services/email_monitor/archive_search.py backend/unisync/mcp/server.py backend/tests/test_mcp_email_archive.py
+      - name: Install minimal MCP runtime for registration smoke check
+        run: python -m pip install 'mcp>=1,<2' 'pydantic>=2'
+      - name: Install testing tools (no LLM clients invoked)
+        run: python -m pip install 'pytest>=8' 'pytest-asyncio>=0.23'
+      - name: Validate MCP tool registration without calling any tools
+        env:
+          PYTHONPATH: backend
+        run: |
+          python - <<'PY'
+          from unisync.mcp.server import mcp
+          found = {item.name for item in mcp._tool_manager.list_tools()}
+          expected = {'unisync_search_emails', 'unisync_get_email', 'unisync_read_email_attachment', 'unisync_get_email_sync_status'}
+          assert expected.issubset(found), f'Missing MCP tools: {sorted(expected - found)}'
+          print(f'All four email retrieval tools registered: {sorted(expected)}')
+          PY
+      - name: Validate additive installer and rollback guards
+        run: python -m unittest discover -s backend/tests -p 'test_email_overlay_install.py' -v
+      - name: Recheck existing email connector and archive regressions
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest -q backend/tests/services/email_monitor
+      - name: Run source durability tests (no network, no LLM)
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m unittest discover -s backend/tests -p 'test_email_source_durability.py' -v
+      - name: Run offline mailbox retrieval tests (no network, no LLM)
+        run: |
+          python -m unittest discover -s backend/tests -p 'test_mcp_email_archive.py' -v
