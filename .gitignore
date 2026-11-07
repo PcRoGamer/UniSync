@@ -55,3 +55,8 @@ Thumbs.db
 .DS_Store
 .vscode/
 .idea/
+
+# Local SHA-guarded edit backups (never commit)
+*.backup-*
+*.before-heartbeat-repair-*
+*.before-yolo-*
