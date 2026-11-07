@@ -53,13 +53,18 @@ async def lifespan(app: FastAPI):
     except Exception as ed_start_err:
         logger.debug("Failed spawning startup EdStem sync task: %s", ed_start_err)
 
-    # Auto-trigger on-disk academic boilerplate scrubber in background
-    try:
-        from unisync.services.disk_cleaner import run_background_disk_scrubber
-        run_background_disk_scrubber(delay_sec=1.0)
-        logger.info("Auto-triggered on-disk academic boilerplate scrubber in background")
-    except Exception as scrub_err:
-        logger.debug("Failed spawning background disk scrubber: %s", scrub_err)
+    # Keep original academic files intact when the operator has selected
+    # egress-only sanitization. The MCP response guard still scrubs outputs.
+    import os
+    if os.environ.get("UNISYNC_SKIP_DISK_SCRUB") != "1":
+        try:
+            from unisync.services.disk_cleaner import run_background_disk_scrubber
+            run_background_disk_scrubber(delay_sec=1.0)
+            logger.info("Auto-triggered on-disk academic boilerplate scrubber in background")
+        except Exception as scrub_err:
+            logger.debug("Failed spawning background disk scrubber: %s", scrub_err)
+    else:
+        logger.info("Skipped on-disk scrubber; MCP egress sanitization remains enabled")
     # Keep the real browser session warm and restore its session cookies at startup.
     import asyncio
     from unisync.api.browser import maintain_canvas_session

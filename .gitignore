@@ -30,11 +30,33 @@ out/
 *.pem
 *.key
 
-# UniSync runtime state and user data
-# This can contain Canvas sessions, signed URLs, course metadata, downloaded
-# lecture/course files, email state, browser profiles and local settings.
+# UniSync runtime state and user data (entire directories, never commit)
+# Includes course files, downloaded lectures, browser sessions, cookies,
+# student details, local email, index, state, and synchronization credentials.
 data/
+data.migration-staging/
+data.migration-*/
 backend/data/
+**/browser_profile/
+**/.auth/
+**/.secrets/
+**/playwright/.auth/
+
+# Credential artifacts and generated local databases (defence in depth)
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+*.p12
+*.pfx
+*.kdbx
+**/credentials.json
+**/*-credentials.json
+**/cookies.json
+**/session_state.json
 
 # Local agent/dev-tool state
 .agents/
@@ -56,7 +78,7 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local SHA-guarded edit backups (never commit)
+# Local SHA-guarded file backups; retained privately in data/maintenance
 *.backup-*
 *.before-heartbeat-repair-*
 *.before-yolo-*
