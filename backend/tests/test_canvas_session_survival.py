@@ -146,3 +146,67 @@ async def test_maintenance_restores_at_startup_then_waits_ten_minutes():
             await maintain_canvas_session()
         factory.return_value.background_sync_session.assert_awaited_once()
         sleep.assert_awaited_once_with(30)
+
+@pytest.mark.asyncio
+async def test_session_keepalive_does_not_force_full_sync():
+    """Healthy login maintenance must not reset the native sync schedule."""
+    with patch('unisync.api.browser.get_camoufox_service') as factory, \
+         patch('unisync.api.browser.asyncio.sleep', new_callable=AsyncMock,
+               side_effect=asyncio.CancelledError), \
+         patch('unisync.services.sync.native_sync.NativeSyncState') as state_cls:
+        service = factory.return_value
+        service.get_status.return_value = {
+            'installed': True, 'has_persistent_profile': True,
+        }
+        service.background_sync_session = AsyncMock(
+            return_value={'authenticated': True, 'login_required': False}
+        )
+        state = state_cls.return_value
+        state.data = {
+            'login_required': False, 'last_run_status': 'up_to_date',
+            'next_run_at': 987654321.0,
+        }
+        with pytest.raises(asyncio.CancelledError):
+            await maintain_canvas_session()
+        assert state.data['next_run_at'] == 987654321.0
+        state.save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_keepalive_resumes_only_after_real_login_interruption():
+    with patch('unisync.api.browser.get_camoufox_service') as factory, \
+         patch('unisync.api.browser.asyncio.sleep', new_callable=AsyncMock,
+               side_effect=asyncio.CancelledError), \
+         patch('unisync.services.sync.native_sync.NativeSyncState') as state_cls:
+        service = factory.return_value
+        service.get_status.return_value = {
+            'installed': True, 'has_persistent_profile': True,
+        }
+        service.background_sync_session = AsyncMock(
+            return_value={'authenticated': True, 'login_required': False}
+        )
+        state = state_cls.return_value
+        state.data = {
+            'login_required': True, 'last_run_status': 'login_required',
+            'next_run_at': 987654321.0,
+        }
+        with pytest.raises(asyncio.CancelledError):
+            await maintain_canvas_session()
+        assert state.data['login_required'] is False
+        assert state.data['next_run_at'] == 0.0
+        state.save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_session_maintenance_does_not_exit_when_profile_created_later():
+    with patch('unisync.api.browser.get_camoufox_service') as factory, \
+         patch('unisync.api.browser.asyncio.sleep', new_callable=AsyncMock,
+               side_effect=asyncio.CancelledError) as sleep:
+        service = factory.return_value
+        service.get_status.return_value = {
+            'installed': True, 'has_persistent_profile': False,
+        }
+        with pytest.raises(asyncio.CancelledError):
+            await maintain_canvas_session()
+        service.background_sync_session.assert_not_called()
+        sleep.assert_awaited_once_with(30)

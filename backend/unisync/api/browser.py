@@ -121,38 +121,54 @@ async def refresh_browser_session() -> dict[str, Any]:
 
 
 async def maintain_canvas_session(interval_seconds: int = 600) -> None:
-    """Restore at startup and periodically refresh while UniSync is running."""
+    """Keep the browser session alive; trigger full sync only after auth recovery.
+
+    A healthy 10-minute session probe is NOT a course-content change. Prior
+    behaviour forced a full native sync after every successful probe, causing
+    repeated Canvas requests and needless browser churn. Profile creation can
+    also happen after startup; do not abandon maintenance forever when it does.
+    """
     service = get_camoufox_service()
-    status = service.get_status()
-    if not status.get("installed") or not status.get("has_persistent_profile"):
+    if not service.get_status().get("installed"):
         return
     prompted = False
     while True:
         delay = interval_seconds
         try:
-            result = await service.background_sync_session()
-            if result.get("authenticated"):
-                prompted = False
-                # A recovered session must resume queued work immediately, not
-                # after the full interval recorded by the failed run.
-                try:
-                    from unisync.services.sync.native_sync import NativeSyncState
-
-                    state = NativeSyncState()
-                    state.data["next_run_at"] = 0.0
-                    state.save()
-                except Exception:
-                    pass
-            elif result.get("login_required") and not prompted:
-                await trigger_interactive_login()
-                prompted = True
-            elif not result.get("login_required"):
+            if not service.get_status().get("has_persistent_profile"):
+                # First-time login can occur after the server starts. Check
+                # again without opening an unsolicited login window.
                 delay = min(interval_seconds, 60)
+            else:
+                result = await service.background_sync_session()
+                if result.get("authenticated"):
+                    prompted = False
+                    # Only a previously blocked sync should be rescheduled.
+                    # Do not turn routine session keepalive into full resync.
+                    try:
+                        from unisync.services.sync.native_sync import NativeSyncState
+
+                        state = NativeSyncState()
+                        if (
+                            state.data.get("login_required")
+                            or state.data.get("last_run_status") in ("login_required", "auth_unknown")
+                        ):
+                            state.data["login_required"] = False
+                            state.data["next_run_at"] = 0.0
+                            state.save()
+                    except Exception as exc:
+                        logger.info("Deferred sync recovery scheduling unavailable (%s)", type(exc).__name__)
+                elif result.get("login_required") and not prompted:
+                    await trigger_interactive_login()
+                    prompted = True
+                elif not result.get("login_required"):
+                    delay = min(interval_seconds, 60)
         except Exception as exc:
-            # Connectivity failures should not wipe usable state or open SSO.
+            # Temporary failure must not destroy the checkpoint or force SSO.
             logger.info("Canvas session maintenance unavailable (%s)", type(exc).__name__)
             delay = min(interval_seconds, 60)
-        # Disk checkpoints capture in-page cookie/token changes between auth checks.
+
+        # Flush resident session changes without logging or exporting cookies.
         while delay > 0:
             pause = min(30, delay)
             await asyncio.sleep(pause)

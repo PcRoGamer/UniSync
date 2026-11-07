@@ -261,6 +261,30 @@ sync_metadata: dict[str, Any] = {
     "echo360_auth_message": "",
 }
 
+def _incomplete_canvas_crawls(courses_root: Path) -> list[dict[str, str]]:
+    """Return course reports that do not prove a complete Canvas crawl."""
+    incomplete = []
+    for report_path in courses_root.glob("*/pages/canvas-*-crawl-report.json"):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            incomplete.append({
+                "course_id": "",
+                "course_directory": report_path.parent.parent.name,
+                "status": "unreadable",
+            })
+            continue
+        if not isinstance(report, dict) or report.get("status") != "complete":
+            course_id = str(report.get("course_id") or "") if isinstance(report, dict) else ""
+            status = str(report.get("status") or "unknown") if isinstance(report, dict) else "invalid"
+            incomplete.append({
+                "course_id": course_id,
+                "course_directory": report_path.parent.parent.name,
+                "status": status,
+            })
+    return incomplete
+
+
 def get_computed_sync_status() -> dict[str, Any]:
     """Computes comprehensive sync status, bridge connectivity, auth state, and asset stats."""
     from datetime import datetime
@@ -356,6 +380,15 @@ def get_computed_sync_status() -> dict[str, Any]:
     except Exception:
         pass
 
+    incomplete_canvas_crawls = []
+    try:
+        from unisync.core.path_service import get_path_service
+        incomplete_canvas_crawls = _incomplete_canvas_crawls(
+            get_path_service().get_user_root() / "courses"
+        )
+    except Exception as exc:
+        logger.debug("Failed checking Canvas crawl reports (%s)", type(exc).__name__)
+
     if is_syncing:
         state = "syncing"
         state_label = "Syncing in Progress"
@@ -384,6 +417,14 @@ def get_computed_sync_status() -> dict[str, Any]:
         state = "lectures_pending"
         state_label = f"{pending_lectures_count} Lectures Awaiting Sync"
         state_desc = f"Latest recording on disk is {latest_lecture_date}. {pending_lectures_count} newer lecture(s) occurred in class (up to {today_str}). Open Canvas Lecture Capture to download recordings."
+    elif incomplete_canvas_crawls:
+        state = "sync_incomplete"
+        state_label = "Canvas Sync Incomplete"
+        affected = ", ".join(
+            item["course_id"] or item["course_directory"]
+            for item in incomplete_canvas_crawls[:5]
+        )
+        state_desc = f"Canvas course discovery is incomplete for: {affected}."
     else:
         state = "up_to_date"
         state_label = "Up to Date"
@@ -407,6 +448,7 @@ def get_computed_sync_status() -> dict[str, Any]:
         "total_assets": total_assets,
         "pending_lectures_count": pending_lectures_count,
         "pending_lectures_dates": pending_lectures_dates,
+        "incomplete_canvas_crawls": incomplete_canvas_crawls,
         "bridge_version": sync_metadata.get("bridge_version") or "",
         "latest_userscript_version": _get_latest_userscript_version(),
         "progress": sync_status.get("progress", {}),
@@ -2273,19 +2315,27 @@ def _canvas_attachment_candidates(
     assignments: list[dict[str, Any]],
     modules: list[dict[str, Any]],
     pages: list[dict[str, Any]],
+    *,
+    files: list[dict[str, Any]] | None = None,
+    announcements: list[dict[str, Any]] | None = None,
+    discussions: list[dict[str, Any]] | None = None,
+    quizzes: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, str]]:
-    """Collect the same linked-file sources the legacy Canvas crawler covered."""
+    """Unify linked Canvas files and the complete accessible files catalog.
+
+    Every source flows through the same ID-based download manifest.
+    """
     from unisync.services.sync.canvas_snapshot import extract_canvas_file_ids
 
     candidates: dict[str, dict[str, str]] = {}
 
     def add(file_id: object, *, title: object = "", folder: str = "canvas") -> None:
         file_id = str(file_id or "").strip()
-        if file_id:
+        if file_id.isdecimal():
             candidates.setdefault(file_id, {"title": str(title or ""), "folder": folder})
 
     for assignment in assignments:
-        title = assignment.get("name") or "assignment"
+        title = str(assignment.get("name") or "assignment")
         for attachment in assignment.get("attachments") or []:
             if isinstance(attachment, dict):
                 add(
@@ -2297,7 +2347,7 @@ def _canvas_attachment_candidates(
             add(file_id, folder=f"assignments/{title}")
 
     for module in modules:
-        module_name = module.get("name") or "module"
+        module_name = str(module.get("name") or "module")
         for item in module.get("items") or []:
             if isinstance(item, dict) and item.get("type") == "File":
                 add(
@@ -2307,9 +2357,31 @@ def _canvas_attachment_candidates(
                 )
 
     for page in pages:
-        page_title = page.get("title") or "page"
+        title = str(page.get("title") or "page")
         for file_id in extract_canvas_file_ids(page.get("body")):
-            add(file_id, folder=f"pages/{page_title}")
+            add(file_id, folder=f"pages/{title}")
+
+    for kind, collection in (
+        ("announcements", announcements or []),
+        ("discussions", discussions or []),
+        ("quizzes", quizzes or []),
+    ):
+        for record in collection:
+            if not isinstance(record, dict):
+                continue
+            title = str(record.get("title") or record.get("name") or kind)
+            for file_id in extract_canvas_file_ids(
+                record.get("message"), record.get("description"), record.get("body")
+            ):
+                add(file_id, folder=f"{kind}/{title}")
+
+    for record in files or []:
+        if isinstance(record, dict):
+            add(
+                record.get("id"),
+                title=record.get("display_name") or record.get("filename"),
+                folder="files",
+            )
     return candidates
 
 
@@ -2359,6 +2431,23 @@ async def _record_native_canvas_file(
         _save_canvas_files(manifest)
 
 
+def _canvas_manifest_file_present(record: object, kb_root: Path) -> bool:
+    """Skip downloads only when their recorded local bytes still exist."""
+    if not isinstance(record, dict):
+        return False
+    relative = record.get("kb_path")
+    if not isinstance(relative, str) or not relative.strip():
+        return False
+    path = Path(relative)
+    if not path.is_absolute():
+        path = kb_root / path
+    try:
+        expected_size = int(record.get("size") or 0)
+        return expected_size > 0 and path.is_file() and path.stat().st_size == expected_size
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 async def _download_canvas_attachments(
     canvas,
     *,
@@ -2373,7 +2462,14 @@ async def _download_canvas_attachments(
     from uuid import uuid4
 
     existing = _load_canvas_files().get(course_id, {}).get("files", {})
-    pending = [(file_id, data) for file_id, data in candidates.items() if file_id not in existing]
+    # A manifest entry is not evidence of a successful surviving download:
+    # if the file was moved, deleted or truncated, retry it.
+    from unisync.core.path_service import get_path_service
+    kb_root = get_path_service().get_knowledge_base_path(kb_name)
+    pending = [
+        (file_id, data) for file_id, data in candidates.items()
+        if not _canvas_manifest_file_present(existing.get(file_id), kb_root)
+    ]
     if not pending:
         return []
 
@@ -2447,13 +2543,25 @@ async def _sync_native_canvas_course(
     assignments = assignments if assignments is not None else await canvas.get_course_assignments(course_id)
     _sync_canvas_course_delta(course_id, course_name, modules, assignments)
     tabs = await canvas.get_course_tabs(course_id)
-    pages = await canvas.get_course_pages(course_id)
+    course_dir, kb_name = _canvas_storage_for_course(course_id, course_name)
+    module_page_slugs = [
+        str(item.get("page_url"))
+        for module in modules for item in (module.get("items") or [])
+        if isinstance(item, dict) and item.get("type") == "Page" and item.get("page_url")
+    ]
+    pages = await canvas.get_course_pages(
+        course_id,
+        cache_path=course_dir / ".canvas_pages_cache.json",
+        seed_slugs=module_page_slugs,
+    )
     discussions = await canvas.get_course_discussions(course_id)
     announcements = await canvas.get_course_announcements(course_id)
     quizzes = await canvas.get_course_quizzes(course_id)
+    files = await canvas.get_course_files(course_id)
 
-    course_dir, kb_name = _canvas_storage_for_course(course_id, course_name)
     writer = CanvasSnapshotWriter(course_dir, course_id)
+    from unisync.core.file_io import atomic_write_json
+    crawl_report = getattr(canvas, "last_page_crawl", {})
     snapshots = int(writer.write_overview(course)) + int(writer.write_modules(modules))
     for assignment in assignments:
         _upsert_canvas_assignment(course_id, course_name, assignment)
@@ -2463,6 +2571,20 @@ async def _sync_native_canvas_course(
     snapshots += writer.write_collection("discussions", discussions)
     snapshots += writer.write_collection("announcements", announcements)
     snapshots += writer.write_collection("quizzes", quizzes)
+
+    # A Respondus-protected exam is still a discoverable assessment. Preserve
+    # official entry URLs and exposed metadata, never attempt quiz questions.
+    from unisync.services.sync.canvas_assessment_catalog import (
+        build_assessment_catalog, write_assessment_catalog,
+    )
+    assessment_entries = build_assessment_catalog(
+        course_id, pages=pages, modules=modules, assignments=assignments,
+        quizzes=quizzes, announcements=announcements, discussions=discussions,
+    )
+    snapshots += int(write_assessment_catalog(
+        course_dir / "pages" / f"canvas-{course_id}-assessment-links.md",
+        course_id, assessment_entries,
+    ))
 
     echo_candidates: list[dict[str, str]] = []
     for page in pages:
@@ -2487,14 +2609,47 @@ async def _sync_native_canvas_course(
                 )
     echo_embeds_added = _persist_canvas_echo_embeds(course_id, echo_candidates)
 
+    attachment_candidates = _canvas_attachment_candidates(
+        assignments, modules, pages,
+        files=files, announcements=announcements,
+        discussions=discussions, quizzes=quizzes,
+    )
     attachments = await _download_canvas_attachments(
         canvas,
         course_id=course_id,
         course_name=course_name,
         course_dir=course_dir,
         kb_name=kb_name,
-        candidates=_canvas_attachment_candidates(assignments, modules, pages),
+        candidates=attachment_candidates,
     )
+    if isinstance(crawl_report, dict):
+        recorded = _load_canvas_files().get(course_id, {}).get("files", {})
+        from unisync.core.path_service import get_path_service
+        kb_root = get_path_service().get_knowledge_base_path(kb_name)
+        unresolved = [
+            file_id for file_id in attachment_candidates
+            if not _canvas_manifest_file_present(recorded.get(file_id), kb_root)
+        ]
+        crawl_report["assessment_links"] = len(assessment_entries)
+        crawl_report["respondus_links"] = sum(
+            entry["access"] == "requires_respondus"
+            for entry in assessment_entries
+        )
+        crawl_report["respondus_handling"] = "metadata_only_no_attempts"
+        crawl_report["file_catalog_count"] = len(files)
+        crawl_report["file_catalog_error"] = getattr(canvas, "last_file_catalog_error", "")
+        crawl_report["file_catalog_error_details"] = getattr(
+            canvas, "last_file_catalog_error_details", {}
+        )
+        crawl_report["attachment_candidates"] = len(attachment_candidates)
+        crawl_report["unresolved_attachment_ids"] = unresolved
+        if unresolved or crawl_report["file_catalog_error"] or crawl_report.get("error"):
+            if crawl_report.get("status") != "failed":
+                crawl_report["status"] = "incomplete"
+        atomic_write_json(
+            course_dir / "pages" / f"canvas-{course_id}-crawl-report.json",
+            crawl_report,
+        )
     lecture_capture_url = _find_lecture_capture_url(tabs)
     _update_canvas_library_metadata(course_id, lecture_capture_url)
     return {"snapshots": snapshots, "attachments": len(attachments), "echo_embeds": echo_embeds_added}

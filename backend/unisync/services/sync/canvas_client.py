@@ -4,7 +4,7 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +16,31 @@ _PAGE_FETCH_SEM = asyncio.Semaphore(5)
 # P2-13: ETag — avoids re-downloading unchanged Canvas modules/pages
 _etag_cache: dict[str, str] = {}
 _etag_data: dict[str, Any] = {}
+
+
+def _safe_response_facts(exc: Exception) -> dict[str, Any]:
+    """Keep useful HTTP failure facts while excluding query strings and bodies."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return {"error_type": type(exc).__name__}
+    url = urlsplit(str(response.url))
+    facts: dict[str, Any] = {
+        "error_type": type(exc).__name__,
+        "status_code": response.status_code,
+        "host": url.hostname,
+        "path": url.path,
+    }
+    allowed_headers = ("content-type", "server", "retry-after")
+    facts["headers"] = {
+        name: response.headers[name][:160]
+        for name in allowed_headers
+        if name in response.headers
+    }
+    location = response.headers.get("location")
+    if location:
+        redirect = urlsplit(urljoin(f"{url.scheme}://{url.netloc}/", location))
+        facts["redirect"] = {"host": redirect.hostname, "path": redirect.path}
+    return facts
 
 
 class CanvasClient:
@@ -32,6 +57,8 @@ class CanvasClient:
             transport=transport,
             timeout=httpx.Timeout(30.0, read=600.0)
         )
+        self.last_file_catalog_error_details: dict[str, Any] = {}
+        self.last_front_page_error_details: dict[str, Any] = {}
 
     async def close(self):
         await self.client.aclose()
@@ -106,29 +133,205 @@ class CanvasClient:
         results = await asyncio.gather(*[_guarded(cid) for cid in course_ids])
         return dict(results)
 
-    async def get_course_pages(self, course_id: str) -> list[dict[str, Any]]:
-        """Fetch every course wiki page and hydrate its body when necessary."""
-        url = f"/api/v1/courses/{course_id}/pages?include[]=body&per_page=100"
+    async def get_course_pages(
+        self, course_id: str, *, cache_path: Path | None = None,
+        seed_slugs: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Catalog all pages; breadth-first crawl remaining same-course links.
+
+        Depth controls priority only. No artificial link-depth or page-count cap.
+        Canvas updated_at metadata lets stable catalog pages reuse cached HTML,
+        avoiding a separate body download on each subsequent sync.
+        """
+        import json
+        from urllib.parse import urljoin
+        from unisync.services.sync.canvas_snapshot import extract_canvas_page_slugs
+
+        report: dict[str, Any] = {
+            "course_id": str(course_id), "status": "running",
+            "catalog_pages": 0, "pages_by_depth": {},
+            "total_pages": 0, "cached_bodies_reused": 0,
+            "failed_page_slugs": [], "error": "",
+        }
+        self.last_page_crawl = report
+        cached: dict[str, dict[str, Any]] = {}
+        if cache_path is not None:
+            try:
+                raw_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(raw_cache, dict) and raw_cache.get("course_id") == str(course_id):
+                    cached = {
+                        str(k): v for k, v in (raw_cache.get("pages") or {}).items()
+                        if isinstance(v, dict)
+                    }
+            except (OSError, ValueError, TypeError):
+                pass
+
+        url: str | None = f"/api/v1/courses/{course_id}/pages?include[]=body&per_page=100"
+        visited_urls: set[str] = set()
+        pages: list[dict[str, Any]] = []
         try:
-            res = await self.client.get(url)
-            res.raise_for_status()
-            data = res.json()
-            pages = data if isinstance(data, list) else []
+            try:
+                while url:
+                    if url in visited_urls:
+                        raise ValueError("Canvas page catalog pagination cycle")
+                    visited_urls.add(url)
+                    response = await self.client.get(url)
+                    response.raise_for_status()
+                    data = response.json()
+                    if not isinstance(data, list):
+                        raise ValueError("Canvas pages endpoint returned an invalid body")
+                    pages.extend(item for item in data if isinstance(item, dict))
+                    next_url = response.links.get("next", {}).get("url")
+                    if next_url:
+                        next_url = urljoin(self.base_url + "/", next_url)
+                        if urlparse(next_url).hostname != urlparse(self.base_url).hostname:
+                            raise ValueError("Canvas page catalog pagination changed host")
+                    url = next_url
+            except Exception as exc:
+                report["status"] = "incomplete"
+                report["error"] = type(exc).__name__
+                report["catalog_error_details"] = _safe_response_facts(exc)
+                logger.error(
+                    "Canvas pages catalog failed for %s (host=%s path=%s status=%s)",
+                    course_id,
+                    report["catalog_error_details"].get("host", ""),
+                    report["catalog_error_details"].get("path", ""),
+                    report["catalog_error_details"].get("status_code", ""),
+                )
+                pages = []
 
-            # The Canvas collection endpoint often returns page metadata only,
-            # despite ``include[]=body``. Fetch those pages individually so the
-            # local snapshot remains useful for search and course materials.
-            async def fetch_body(page: dict[str, Any]) -> dict[str, Any]:
-                if isinstance(page.get("body"), str) or not page.get("url"):
+            # Some Canvas course roles can read named pages but cannot enumerate
+            # the wiki-page catalogue. Fetch the official front page as an
+            # entry point, then retain the same unbounded same-course BFS.
+            catalog_page_count = len(pages)
+            if not pages:
+                front_page = await self.get_course_front_page(course_id)
+                if front_page and front_page.get("url"):
+                    pages.append(front_page)
+                    report["front_page_fallback"] = True
+                    report["front_page_slug"] = str(front_page["url"])
+                else:
+                    report["front_page_fallback"] = False
+                    if self.last_front_page_error_details:
+                        report["front_page_error_details"] = self.last_front_page_error_details
+
+            report["catalog_pages"] = catalog_page_count
+
+            async def hydrate(page: dict[str, Any]) -> dict[str, Any]:
+                slug = str(page.get("url") or "")
+                if isinstance(page.get("body"), str) or not slug:
                     return page
+                prior = cached.get(slug) or {}
+                revision = page.get("updated_at") or page.get("last_edited_at")
+                if (
+                    revision and prior.get("revision") == revision
+                    and isinstance(prior.get("body"), str)
+                ):
+                    report["cached_bodies_reused"] += 1
+                    return {**page, "body": prior["body"]}
                 async with _PAGE_FETCH_SEM:
-                    detail = await self.get_course_page(course_id, str(page["url"]))
-                return detail or page
+                    detail = await self.get_course_page(course_id, slug)
+                if isinstance(detail, dict):
+                    return {**page, **detail}
+                report["failed_page_slugs"].append(slug)
+                return page
 
-            return list(await asyncio.gather(*(fetch_body(page) for page in pages)))
-        except Exception as e:
-            logger.error(f"Failed to fetch Canvas pages for {course_id}: {e}")
+            hydrated = list(await asyncio.gather(*(hydrate(p) for p in pages)))
+            by_slug: dict[str, dict[str, Any]] = {
+                str(p["url"]): p for p in hydrated if p.get("url")
+            }
+
+            # Module-listed pages are entry points even if missing from the index.
+            attempted = set(by_slug)
+            frontier = hydrated
+            pending_seeds = set(seed_slugs or []) - attempted
+            depth = 0
+            while frontier or pending_seeds:
+                discovered = set(pending_seeds)
+                pending_seeds.clear()
+                for page in frontier:
+                    discovered.update(extract_canvas_page_slugs(course_id, page.get("body")))
+                new_slugs = sorted(discovered - attempted)
+                if not new_slugs:
+                    break
+                attempted.update(new_slugs)
+                depth += 1
+                report["pages_by_depth"][str(depth)] = len(new_slugs)
+
+                async def fetch_linked(slug: str) -> dict[str, Any] | None:
+                    async with _PAGE_FETCH_SEM:
+                        return await self.get_course_page(course_id, slug)
+
+                details = await asyncio.gather(*(fetch_linked(slug) for slug in new_slugs))
+                frontier = []
+                for slug, detail in zip(new_slugs, details):
+                    if isinstance(detail, dict) and isinstance(detail.get("body"), str):
+                        by_slug[str(detail.get("url") or slug)] = detail
+                        frontier.append(detail)
+                    else:
+                        report["failed_page_slugs"].append(slug)
+
+            if cache_path is not None:
+                from unisync.core.file_io import atomic_write_json
+                updated_cache = {
+                    slug: {
+                        "revision": p.get("updated_at") or p.get("last_edited_at"),
+                        "body": p["body"],
+                    }
+                    for slug, p in by_slug.items()
+                    if isinstance(p.get("body"), str)
+                }
+                # Avoid needless disk writes on unchanged syncs.
+                if updated_cache != cached:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_json(cache_path, {
+                        "course_id": str(course_id), "pages": updated_cache
+                    })
+            report["total_pages"] = len(by_slug)
+            report["status"] = (
+                "incomplete"
+                if report["failed_page_slugs"] or report.get("error")
+                else "complete"
+            )
+            logger.info(
+                "Canvas course %s: %s, %d pages, %d cached bodies, %d failures",
+                course_id, report["status"], len(by_slug),
+                report["cached_bodies_reused"], len(report["failed_page_slugs"]),
+            )
+            return list(by_slug.values())
+        except Exception as exc:
+            report.update(
+                status="failed",
+                error=type(exc).__name__,
+                error_details=_safe_response_facts(exc),
+            )
+            logger.error(
+                "Canvas pages discovery failed for %s (host=%s path=%s status=%s)",
+                course_id,
+                report["error_details"].get("host", ""),
+                report["error_details"].get("path", ""),
+                report["error_details"].get("status_code", ""),
+            )
             return []
+
+    async def get_course_front_page(self, course_id: str) -> dict[str, Any] | None:
+        """Fetch Canvas's declared course front page without enumerating pages."""
+        self.last_front_page_error_details = {}
+        try:
+            response = await self.client.get(f"/api/v1/courses/{course_id}/front_page")
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            self.last_front_page_error_details = _safe_response_facts(exc)
+            logger.error(
+                "Canvas front page failed for %s (host=%s path=%s status=%s)",
+                course_id,
+                self.last_front_page_error_details.get("host", ""),
+                self.last_front_page_error_details.get("path", ""),
+                self.last_front_page_error_details.get("status_code", ""),
+            )
+            return None
 
     async def get_course_page(self, course_id: str, page_url: str) -> dict[str, Any] | None:
         """Fetch one Canvas wiki page, including its HTML body and updated date."""
@@ -154,15 +357,40 @@ class CanvasClient:
             return []
 
     async def get_course_files(self, course_id: str) -> list[dict[str, Any]]:
-        """Fetch direct files list for a course."""
-        url = f"/api/v1/courses/{course_id}/files?per_page=100"
+        """Enumerate all accessible files, following Canvas Link pagination."""
+        self.last_file_catalog_error_details = {}
+        self.last_file_catalog_error = ""
+        url: str | None = f"/api/v1/courses/{course_id}/files?per_page=100"
+        visited: set[str] = set()
+        files: list[dict[str, Any]] = []
         try:
-            res = await self.client.get(url)
-            res.raise_for_status()
-            data = res.json()
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logger.error(f"Failed to fetch Canvas files list for {course_id}: {e}")
+            while url:
+                if url in visited:
+                    raise ValueError("Canvas file catalog pagination cycle")
+                visited.add(url)
+                response = await self.client.get(url)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, list):
+                    raise ValueError("Canvas files endpoint returned an invalid body")
+                files.extend(item for item in data if isinstance(item, dict))
+                next_url = response.links.get("next", {}).get("url")
+                if next_url:
+                    next_url = urljoin(self.base_url + "/", next_url)
+                    if urlparse(next_url).hostname != urlparse(self.base_url).hostname:
+                        raise ValueError("Canvas files pagination changed host")
+                url = next_url
+            return files
+        except Exception as exc:
+            self.last_file_catalog_error = type(exc).__name__
+            self.last_file_catalog_error_details = _safe_response_facts(exc)
+            logger.error(
+                "Canvas files catalog failed for %s (host=%s path=%s status=%s)",
+                course_id,
+                self.last_file_catalog_error_details.get("host", ""),
+                self.last_file_catalog_error_details.get("path", ""),
+                self.last_file_catalog_error_details.get("status_code", ""),
+            )
             return []
 
     async def get_course_discussions(self, course_id: str) -> list[dict[str, Any]]:
