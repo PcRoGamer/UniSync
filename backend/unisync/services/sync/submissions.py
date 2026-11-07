@@ -81,6 +81,29 @@ def clean_rubric_assessment(raw_assessment: object) -> dict:
     return cleaned
 
 
+def has_meaningful_assessment(record: object) -> bool:
+    """Capture submitted work AND grade-only assessment feedback.
+
+    Canvas may give an assignment a score, rubric or marker comment without
+    providing a submitted_at timestamp (on-paper, external-tool, quizzes, etc).
+    Do not archive empty unsubmitted placeholder records.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get('submitted_at'):
+        return True
+    if record.get('submission_type') not in (None, '', 'none'):
+        return True
+    if record.get('score') is not None or record.get('grade') is not None or record.get('graded_at'):
+        return True
+    if record.get('workflow_state') == 'graded':
+        return True
+    return any(bool(record.get(key)) for key in (
+        'submission_comments', 'submission_html_comments',
+        'rubric_assessment', 'full_rubric_assessment',
+    ))
+
+
 def rubric_feedback_lines(assignment: dict, assessment: object) -> list[str]:
     if not isinstance(assessment, dict) or not assessment:
         return []
@@ -182,7 +205,9 @@ class SubmissionSync:
             if record['status'] in ('cached', 'downloaded'):
                 record['status'] = 'available'
             files.append({'id': attachment['id'], 'filename': filename, **record})
+        feedback_only = not bool(submission.get('submitted_at') or submission.get('submission_type') not in (None, '', 'none'))
         metadata = {
+            'record_kind': 'grade_or_feedback_only' if feedback_only else 'submitted',
             'course': course_name, 'course_id': course['id'],
             'assignment_id': assignment['id'], 'assignment': assignment.get('name', ''),
             'attempt': submission.get('attempt'), 'submitted_at': submission.get('submitted_at'),
@@ -200,7 +225,8 @@ class SubmissionSync:
         }
         write_changed(manifest, json.dumps(metadata, indent=2, ensure_ascii=False))
         text = BeautifulSoup(submission.get('body') or '', 'html.parser').get_text('\n', strip=True)
-        lines = [f'# Submitted work: {metadata["assignment"]}', f'Course: {course_name}',
+        heading = 'Assessment feedback (no submitted-at timestamp)' if feedback_only else 'Submitted work'
+        lines = [f'# {heading}: {metadata["assignment"]}', f'Course: {course_name}',
                  f'Canvas assignment: {metadata["canvas_url"]}', f'Attempt: {attempt}',
                  f'Submitted at: {metadata["submitted_at"]}',
                  f'Group assignment: {metadata["group_assignment"]}',
@@ -228,10 +254,11 @@ class SubmissionSync:
         if rubric_lines:
             lines.extend(['\n### Rubric assessment\n', *rubric_lines])
         write_changed(folder / f'{prefix}_submission.md', '\n'.join(lines))
-        return {'files': len(files), 'failed': sum(f['status'] == 'failed' for f in files)}
+        return {'files': len(files), 'failed': sum(f['status'] == 'failed' for f in files),
+                'feedback_only': int(feedback_only)}
 
     async def run(self, course_id: str | None = None) -> dict:
-        counts = {'attempts': 0, 'files': 0, 'failed_files': 0, 'errors': []}
+        counts = {'attempts': 0, 'feedback_only': 0, 'files': 0, 'failed_files': 0, 'errors': []}
         courses = await self.pages('/api/v1/courses?enrollment_type=student&enrollment_state=active&per_page=100')
         for course in courses:
             if course_id and str(course['id']) != str(course_id):
@@ -242,7 +269,7 @@ class SubmissionSync:
                 )
                 for assignment in assignments:
                     summary = assignment.get('submission') or {}
-                    if not (summary.get('submitted_at') or summary.get('submission_type')):
+                    if not has_meaningful_assessment(summary):
                         continue
                     try:
                         response = await self.client.get(
@@ -256,15 +283,16 @@ class SubmissionSync:
                             ])
                         response.raise_for_status()
                         current = response.json()
-                        attempts = {s.get('attempt'): s for s in current.get('submission_history', []) if s.get('submitted_at')}
-                        attempts[current.get('attempt')] = current
+                        attempts = {s.get('attempt') or 1: s for s in current.get('submission_history', [])
+                                    if has_meaningful_assessment(s)}
+                        if has_meaningful_assessment(current):
+                            attempts[current.get('attempt') or 1] = current
                         for submission in attempts.values():
-                            if not submission.get('submitted_at'):
-                                continue
                             result = await self.archive(course, assignment, submission)
                             counts['attempts'] += 1
                             counts['files'] += result['files']
                             counts['failed_files'] += result['failed']
+                            counts['feedback_only'] += result.get('feedback_only', 0)
                     except Exception as exc:
                         counts['errors'].append({'assignment_id': assignment['id'], 'error': type(exc).__name__})
             except Exception as exc:

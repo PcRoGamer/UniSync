@@ -22,12 +22,41 @@ _SAFE_NAME = re.compile(r"[^a-z0-9]+")
 
 def extract_canvas_file_ids(*values: object) -> set[str]:
     """Return Canvas file IDs linked from HTML or plain-text course content."""
-    return {
+    ids = {
         match.group(1)
         for value in values
         if isinstance(value, str)
         for match in _FILE_ID.finditer(value)
     }
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        for match in re.finditer(r"/files\?[^\"'\s<>]*?preview=(\d+)", value):
+            ids.add(match.group(1))
+    return ids
+
+
+
+def extract_canvas_page_slugs(course_id: str, *values: object) -> set[str]:
+    """Discover same-course page links embedded in a Canvas rich-text page."""
+    from urllib.parse import unquote, urljoin, urlparse
+
+    prefix = f"/courses/{course_id}/pages/"
+    origin = f"https://canvas.lms.unimelb.edu.au{prefix}"
+    slugs: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        for link in BeautifulSoup(value, "html.parser").select("a[href]"):
+            resolved = urlparse(urljoin(origin, str(link.get("href") or "")))
+            if resolved.hostname != "canvas.lms.unimelb.edu.au":
+                continue
+            if not resolved.path.startswith(prefix):
+                continue
+            slug = unquote(resolved.path[len(prefix):])
+            if slug and "/" not in slug and slug not in {".", ".."}:
+                slugs.add(slug)
+    return slugs
 
 
 def _safe_name(value: object, fallback: str) -> str:

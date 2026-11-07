@@ -181,37 +181,32 @@ class DownloadRegistry:
 
             # Echo360 subtitle tracks are useful downloaded assets even when
             # the associated video stream is unavailable or still queued.
-            libraries_file = data_root / "libraries" / "libraries.json"
-            libraries: list[dict[str, Any]] = []
-            if libraries_file.exists():
-                raw_libraries = json.loads(libraries_file.read_text(encoding="utf-8"))
-                if isinstance(raw_libraries, dict):
-                    libraries = [
-                        value for value in raw_libraries.values()
-                        if isinstance(value, dict)
-                    ]
+            from unisync.mcp.course_scope import known_courses, lecture_course
+            catalog = known_courses()
+            repaired = 0
 
             subtitles_dir = data_root / "cache" / "echo360_subtitles"
             for subtitle_path in subtitles_dir.glob("*.vtt") if subtitles_dir.exists() else []:
                 stem = subtitle_path.stem
-                library = next(
-                    (
-                        lib for lib in libraries
-                        if lib.get("echo360_course_id")
-                        and str(lib["echo360_course_id"]) in stem
-                    ),
-                    {},
-                )
+                owner = lecture_course(stem, catalog=catalog)
+                library = catalog.get(owner, {})
                 item_id = f"{stem}:subtitles"
                 key = f"echo360:{item_id}"
                 normalized_path = self._normalize_path(subtitle_path)
-                if (
-                    key in self._items
-                    or any(
-                        self._normalize_path(item.local_filepath) == normalized_path
-                        for item in self._items.values()
-                        if item.local_filepath
-                    )
+                if key in self._items:
+                    item = self._items[key]
+                    if owner and not item.course_name:
+                        item.course_id = library["section_id"]
+                        item.course_name = library["full_title"]
+                        item.metadata["course_code"] = owner
+                        item.metadata["ownership_method"] = "verified_echo360_section"
+                        self._dirty = True
+                        repaired += 1
+                    continue
+                if any(
+                    self._normalize_path(item.local_filepath) == normalized_path
+                    for item in self._items.values()
+                    if item.local_filepath
                 ):
                     continue
                 self.register(
@@ -223,11 +218,11 @@ class DownloadRegistry:
                         f"transcript.vtt?lessonId={stem}"
                     ),
                     local_filepath=subtitle_path,
-                    course_id=str(library.get("echo360_course_id", "")),
-                    course_name=str(library.get("name", "")),
+                    course_id=str(library.get("section_id", "")),
+                    course_name=str(library.get("full_title", "")),
                     size_bytes=subtitle_path.stat().st_size,
                     content_type="text/vtt",
-                    metadata={"asset_type": "subtitle"},
+                    metadata={"asset_type": "subtitle", "course_code": owner or "", "ownership_method": "verified_echo360_section" if owner else "unclassified"},
                     auto_flush=False,
                 )
                 added += 1
@@ -265,9 +260,9 @@ class DownloadRegistry:
                     except (OSError, TypeError, ValueError):
                         continue
 
-            if added:
+            if added or repaired:
                 self.flush()
-                logger.info("Reconciled %d local sync asset(s) into DownloadRegistry", added)
+                logger.info("Reconciled %d assets and repaired %d subtitle owners", added, repaired)
         except (OSError, TypeError, ValueError):
             logger.debug("Local asset reconciliation skipped", exc_info=True)
 
