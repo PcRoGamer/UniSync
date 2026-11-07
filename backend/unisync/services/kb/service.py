@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from txtai import Embeddings
+from unisync.mcp.course_scope import resolve_course, matches_course
 
 from unisync.services.kb.parsers import (
     DoclingParser,
@@ -39,9 +40,10 @@ class KnowledgeBaseService:
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     ) -> None:
         if kb_dir is None:
-            # Default to data/kb in UniSync repository root
-            base_dir = Path(__file__).resolve().parents[4]  # c:\Users\Admin\Desktop\UniSync
-            self.kb_dir = base_dir / "data" / "kb"
+            # Always use the same active UniSync data root as course files.
+            # The MCP tunnel may run its code from a different checkout.
+            from unisync.core.path_service import get_path_service
+            self.kb_dir = get_path_service().get_user_root() / "kb"
         else:
             self.kb_dir = Path(kb_dir)
 
@@ -110,6 +112,27 @@ class KnowledgeBaseService:
             )
         return self._embeddings
 
+    def _rebase_indexed_path(self, source_path: str) -> str:
+        """Resolve legacy absolute source paths against this KB's active data root.
+
+        Older txtai SQLite metadata embeds the previous installation location.
+        Keep its existing vector/BM25 index usable without forcing an expensive
+        re-embedding, while returning source paths in the single active data root.
+        """
+        if not source_path:
+            return ""
+        original = str(source_path)
+        normalized = original.replace("\\", "/")
+        boundary = "/data/"
+        position = normalized.lower().find(boundary)
+        if position >= 0:
+            relative = normalized[position + len(boundary):]
+            root = self.kb_dir.parent.resolve()
+            candidate = (root / relative).resolve()
+            if candidate.is_relative_to(root) and candidate.is_file():
+                return str(candidate)
+        return original
+
     def search(
         self,
         query: str,
@@ -117,6 +140,7 @@ class KnowledgeBaseService:
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         """Perform semantic hybrid search across indexed course materials."""
+        scoped_code = resolve_course(course)
         embeddings = self._get_embeddings()
 
         # Retrieve a broader candidate set for two-stage cross-encoder reranking
@@ -127,8 +151,8 @@ class KnowledgeBaseService:
             "section_title, timestamp_start, timestamp_end, score"
         )
 
-        if course:
-            safe_course = course.replace("'", "''")
+        if scoped_code:
+            safe_course = scoped_code.replace("'", "''")
             sql = (
                 f"select {columns} from txtai where similar('{safe_query}') "
                 f"and course like '%{safe_course}%' limit {fetch_limit}"
@@ -144,13 +168,17 @@ class KnowledgeBaseService:
 
         formatted: list[dict[str, Any]] = []
         for r in raw_results:
+            # SQL can fail and fall back to an unfiltered vector search.
+            # Enforce provenance again before ranking or returning any passage.
+            if not matches_course(r.get("course"), scoped_code):
+                continue
             formatted.append(
                 {
                     "id": r.get("id"),
                     "score": round(float(r.get("score", 0.0)), 4),
                     "text": r.get("text", ""),
                     "file_name": r.get("file_name", ""),
-                    "file_path": r.get("file_path", ""),
+                    "file_path": self._rebase_indexed_path(r.get("file_path", "")),
                     "course": r.get("course", ""),
                     "content_type": r.get("content_type", "document"),
                     "section_title": r.get("section_title"),
@@ -296,16 +324,8 @@ class KnowledgeBaseService:
 
         # 2. Parse Echo360 Lecture Subtitles (.vtt)
         if s_dir.exists():
-            section_map: dict[str, str] = {}
-            try:
-                from unisync.api.lectures import _load_libraries
-                for lib in _load_libraries().values():
-                    sec_id = lib.get("echo360_course_id")
-                    kb = lib.get("kb_name") or lib.get("name")
-                    if sec_id and kb:
-                        section_map[sec_id] = kb
-            except Exception:
-                pass
+            from unisync.mcp.course_scope import known_courses, lecture_course
+            catalog = known_courses()
 
             for f in s_dir.glob("*.vtt"):
                 if not f.is_file():
@@ -313,19 +333,14 @@ class KnowledgeBaseService:
 
                 mtime = f.stat().st_mtime
                 file_key = str(f.resolve())
-                if not force and file_key in self._manifest["files"]:
-                    if self._manifest["files"][file_key].get("mtime") == mtime:
-                        files_skipped_count += 1
-                        continue
-
-                course_name = "Lecture Recording"
-                if "blaw" in f.name.lower():
-                    course_name = "BLAW10001_2026_SM2"
-                else:
-                    for sec_id, cname in section_map.items():
-                        if sec_id in f.name:
-                            course_name = cname
-                            break
+                owner = lecture_course(f.name, catalog=catalog)
+                course_code = owner or "UNCLASSIFIED"
+                course_name = catalog[owner]["full_title"] if owner else "UNCLASSIFIED"
+                previous = self._manifest["files"].get(file_key, {})
+                # A metadata-only change MUST reindex an unchanged transcript.
+                if not force and previous.get("mtime") == mtime and previous.get("course_code") == course_code:
+                    files_skipped_count += 1
+                    continue
 
                 try:
                     chunks = self.vtt_parser.parse(f, course_name=course_name)
@@ -336,6 +351,16 @@ class KnowledgeBaseService:
                             "mtime": mtime,
                             "chunk_count": len(chunks),
                             "type": "lecture_transcript",
+                            "course_code": course_code,
+                        }
+                    else:
+                        # Preserve verified ownership for caption-less recordings.
+                        # An updated mtime causes a fresh parse next sync.
+                        self._manifest["files"][file_key] = {
+                            "mtime": mtime,
+                            "chunk_count": 0,
+                            "type": "lecture_transcript_empty",
+                            "course_code": course_code,
                         }
                 except Exception as exc:
                     logger.error("Error parsing transcript %s: %s", f.name, exc)

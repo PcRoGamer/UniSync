@@ -19,6 +19,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from unisync.mcp.course_scope import CODE_RE, enrolled_courses, resolve_course, matches_course, lecture_course, course_dirs, archived_courses, known_courses
 
 # Prevent HuggingFace/tqdm from writing progress bars to sys.stdout (corrupts MCP stdio JSON-RPC)
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -40,14 +41,19 @@ mcp = FastMCP(
     dependencies=["pypdf"],
 )
 
+from unisync.mcp.egress import install_egress_guard, scrub_text
+install_egress_guard(mcp)
+
 logger = logging.getLogger("unisync.mcp")
 
-# Auto-trigger on-disk academic boilerplate scrubber in background on MCP startup
-try:
-    from unisync.services.disk_cleaner import run_background_disk_scrubber
-    run_background_disk_scrubber(delay_sec=0.5)
-except Exception as scrub_err:
-    logger.debug("Failed spawning background disk scrubber: %s", scrub_err)
+# In a tunnel reading the active desktop data store, never rewrite originals
+# in the background. Every MCP tool response is scrubbed at the egress gate.
+if os.environ.get("UNISYNC_SKIP_DISK_SCRUB") != "1":
+    try:
+        from unisync.services.disk_cleaner import run_background_disk_scrubber
+        run_background_disk_scrubber(delay_sec=0.5)
+    except Exception as scrub_err:
+        logger.debug("Failed spawning background disk scrubber: %s", scrub_err)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,8 +317,33 @@ def unisync_get_overview() -> str:
     except Exception:
         pass
 
+    # Surface the latest durable agent handoff in the existing overview tool.
+    # Existing ChatGPT connector snapshots can discover continuity even before
+    # newly added workspace tools are refreshed in Plugins.
+    agent_continuity: dict[str, Any] = {"available": False}
+    try:
+        from unisync.mcp.agent_workspace import list_files as list_agent_files, read_file as read_agent_file
+        handoffs = list_agent_files(category="handoffs", limit=20).get("entries", [])
+        recent = next(
+            (entry for entry in handoffs if entry.get("path") != "handoffs/START_HERE.md"),
+            None,
+        )
+        if recent:
+            snippet = read_agent_file(recent["path"], max_chars=1800)
+            agent_continuity = {
+                "available": True,
+                "latest_handoff_path": recent["path"],
+                "latest_handoff_excerpt": snippet.get("content", ""),
+                "has_more": snippet.get("has_more", False),
+                "workspace_hint": "Use unisync_agent_workspace_list/read for full persistent files after refreshing plugin actions.",
+            }
+    except Exception:
+        # Academic overview must not fail due to an optional local handoff.
+        pass
+
     return json.dumps({
         "summary": "Academic Semester Overview & Executive Briefing",
+        "agent_workspace": agent_continuity,
         "institution": institution,
         "term": term,
         "current_time_utc": now_dt.isoformat()[:19] + "Z",
@@ -378,7 +409,22 @@ def unisync_list_courses() -> str:
 
     courses.sort(key=lambda x: (not x["is_academic"], x["code"]))
 
+    archived = {code: item for code, item in archived_courses().items()
+                if code not in {c["code"] for c in courses}}
+    from unisync.core.path_service import get_path_service
+    cache = get_path_service().get_user_root() / "cache" / "echo360_subtitles"
+    archived_results = [{
+        "code": code,
+        "name": value["name"],
+        "echo360_section_id": value["section_id"],
+        "lecture_count": sum(1 for p in cache.glob("*.vtt") if value["section_id"] in p.name.lower()) if cache.exists() else 0,
+        "enrolled": False,
+        "classification": "archived_unlinked",
+    } for code,value in sorted(archived.items())]
+
     return json.dumps({
+        "archived_unlinked_subjects": archived_results,
+        "archived_unlinked_count": len(archived_results),
         "total_courses": len(courses),
         "academic_subjects": [c for c in courses if c["is_academic"]],
         "all_enrolled": courses,
@@ -394,6 +440,7 @@ def unisync_get_deadlines(
     filter: Literal["upcoming", "missed", "graded", "completed", "all"] = "upcoming",
     course: str | None = None,
     limit: int = 20,
+    offset: int = 0,
 ) -> str:
     """List academic deadlines, assignments, and quizzes from Canvas LMS and EdStem.
 
@@ -417,14 +464,11 @@ def unisync_get_deadlines(
     now_dt = datetime.now(timezone.utc)
     results = []
 
+    scoped_code = resolve_course(course)
     for t in items:
         # Course filter
-        if course:
-            c_target = course.lower()
-            t_course = (t.course or "").lower()
-            t_notes = (t.notes or "").lower()
-            if c_target not in t_course and c_target not in t_notes:
-                continue
+        if not matches_course(t.course, scoped_code):
+            continue
 
         is_done = t.status == "done"
         due_iso, due_dt = _normalize_iso(t.due_at)
@@ -469,7 +513,9 @@ def unisync_get_deadlines(
     return json.dumps({
         "filter": filter,
         "total_matches": len(results),
-        "deadlines": results[:limit],
+        "offset": offset,
+        "next_offset": offset + limit if offset + limit < len(results) else None,
+        "deadlines": results[offset:offset + limit],
     }, indent=2)
 
 
@@ -512,6 +558,7 @@ def unisync_get_assignment_detail(
             "suggestion": "Call unisync_get_deadlines to see available assignment titles and IDs.",
         })
 
+    scoped_code = resolve_course(course)
     needle = target_raw.lower()
     matched = None
 
@@ -525,6 +572,8 @@ def unisync_get_assignment_detail(
 
     # 1. Exact ID match (item id, canvas id, or source_id)
     for t in items:
+        if not matches_course(t.course, scoped_code):
+            continue
         t_id = str(t.id).lower()
         t_source = str(getattr(t, "source_id", "") or "").lower()
         if needle in (t_id, t_source) or t_source.endswith(f":{needle}"):
@@ -534,7 +583,7 @@ def unisync_get_assignment_detail(
     # 2. Direct title match or normalized abbreviation match (e.g. A1.2 <-> Assignment 1.2)
     if not matched:
         for t in items:
-            if course and course.lower() not in (t.course or "").lower():
+            if not matches_course(t.course, scoped_code):
                 continue
             t_title = (t.title or "").lower()
             if needle in t_title or t_title in needle:
@@ -549,7 +598,7 @@ def unisync_get_assignment_detail(
         terms = [w for w in re.split(r"[\s_\-]+", needle) if len(w) > 1]
         best_score = 0
         for t in items:
-            if course and course.lower() not in (t.course or "").lower():
+            if not matches_course(t.course, scoped_code):
                 continue
             t_title = (t.title or "").lower()
             score = sum(1 for term in terms if term in t_title)
@@ -648,7 +697,16 @@ def unisync_get_assignment_detail(
     sub_iso, _ = _normalize_iso(matched.submitted_at)
     grad_iso, _ = _normalize_iso(matched.graded_at)
 
-    return json.dumps({
+    try:
+        from unisync.mcp.submission_archive import load_submission_archive
+        archive_data = load_submission_archive(
+            user_root=user_root, course=matched.course or "", canvas_url=matched.url
+        )
+    except Exception as exc:
+        logger.debug("Unable to read cached Canvas submission metadata: %s", exc)
+        archive_data = {}
+
+    detail = {
         "id": str(matched.id),
         "title": matched.title,
         "course": matched.course or "University Subject",
@@ -669,7 +727,32 @@ def unisync_get_assignment_detail(
         "specification_source": "EdStem Lesson (Authoritative Written Specification)" if ed_lesson_file else "Canvas LMS",
         "rubric": formatted_rubric,
         "submission_comments": matched.submission_comments or [],
-    }, indent=2)
+    }
+    if archive_data:
+        # Prefer authoritative Canvas submission comments and criterion grading,
+        # while preserving existing assignment fields and legacy consumers.
+        if archive_data["submission_comments"]:
+            detail["submission_comments"] = archive_data["submission_comments"]
+        detail.update({k: v for k, v in archive_data.items() if k != "submission_comments"})
+
+    if getattr(matched, "source", "") == "edstem" and ed_lesson_id:
+        try:
+            from unisync.mcp.edstem_archive import load_edstem_submission
+            ed_archive = load_edstem_submission(
+                user_root=user_root, course=matched.course or "",
+                lesson_id=ed_lesson_id,
+            )
+            if ed_archive:
+                detail.update(ed_archive)
+                if ed_archive.get("edstem_grade_status") == "graded":
+                    detail["score"] = ed_archive["edstem_verified_score"]
+                    detail["points_possible"] = ed_archive["edstem_verified_points_possible"]
+                    detail["grade"] = str(detail["score"])
+                    detail["is_graded"] = True
+                    detail["submission_status"] = "graded"
+        except (OSError, ValueError, PermissionError) as exc:
+            logger.debug("EdStem submission lookup unavailable: %s", type(exc).__name__)
+    return json.dumps(detail, indent=2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -682,6 +765,7 @@ def unisync_search_course_materials(
     course: str | None = None,
     limit: int = 10,
     search_content: bool = True,
+    offset: int = 0,
 ) -> str:
     """Search downloaded course slides, PDF handouts, tutorial worksheets, and module files.
 
@@ -710,6 +794,7 @@ def unisync_search_course_materials(
     except Exception:
         user_root = Path("data")
 
+    scoped_code = resolve_course(course)
     # 1. Abbreviation & Academic Synonym Expansion
     q_clean = query.lower().strip()
     raw_terms = [w for w in re.split(r"[\s_\-]+", q_clean) if w]
@@ -742,7 +827,7 @@ def unisync_search_course_materials(
     # 2. Match registry items
     for item in items:
         c_name = item.course_name or (item.metadata.get("course_name") if item.metadata else "") or ""
-        if course and course.lower() not in c_name.lower():
+        if not matches_course(c_name, scoped_code):
             continue
 
         filename = Path(item.local_filepath).name if item.local_filepath else item.title
@@ -783,13 +868,7 @@ def unisync_search_course_materials(
         except re.error:
             content_pattern = re.compile(re.escape(query), re.IGNORECASE)
 
-        if course:
-            c_filter = course.lower().strip()
-            target_dirs = [d for d in courses_dir.iterdir() if d.is_dir() and c_filter in d.name.lower()]
-            if not target_dirs:
-                target_dirs = [courses_dir]
-        else:
-            target_dirs = [courses_dir]
+        target_dirs = course_dirs(courses_dir, scoped_code)
 
         for t_dir in target_dirs:
             for f in t_dir.glob("**/*"):
@@ -854,8 +933,7 @@ def unisync_search_course_materials(
                         match_data["line_number"] = line_no
                         match_data["matched_excerpt"] = content_match
                     scored_matches.append((score, match_data))
-                if len(scored_matches) >= 30:
-                    break
+                # Do not stop at 30: callers need accurate total_found and pagination.
 
     # 4. Full-text Content Search Fallback via Knowledge Base (only when exact hits < limit or conceptual query)
     has_exact_content = any(m[1].get("match_type") == "exact_content_match" for m in scored_matches)
@@ -867,8 +945,10 @@ def unisync_search_course_materials(
         try:
             from unisync.services.kb import get_kb_service
             kb = get_kb_service()
-            kb_results = kb.search(query=query, course=course, limit=max(3, limit - len(scored_matches)))
+            kb_results = kb.search(query=query, course=scoped_code, limit=max(3, limit - len(scored_matches)))
             for kr in kb_results:
+                if not matches_course(kr.get("course"), scoped_code):
+                    continue
                 f_name = kr.get("file_name") or Path(kr.get("file_path", "")).name
                 f_path = kr.get("file_path") or f_name
                 resolved_p = str(Path(f_path).resolve()) if f_path else f_name
@@ -906,7 +986,9 @@ def unisync_search_course_materials(
     return json.dumps({
         "query": query,
         "total_found": len(deduped),
-        "files": deduped[:limit],
+        "offset": offset,
+        "next_offset": offset + limit if offset + limit < len(deduped) else None,
+        "files": deduped[offset:offset + limit],
     }, indent=2)
 
 
@@ -915,159 +997,44 @@ def unisync_search_course_materials(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def unisync_read_course_file(file_path: str, max_chars: int = 8000) -> str:
-    """Read and extract text from a downloaded course document (PDF slides, Word docx, PowerPoint pptx, notes).
+def unisync_read_course_file(
+    file_path: str, max_chars: int = 8000, offset: int = 0, page: int = 1, course: str | None = None
+) -> str:
+    """Read approved UniSync coursework with exact scrubbed-text continuation.
 
-    Args:
-        file_path: Relative or absolute path to the file (as returned by unisync_search_course_materials).
-        max_chars: Maximum characters to return to avoid overflowing agent context (default 8000).
-
-    Returns:
-        Extracted text content from the file with metadata.
+    For PDF, page is a 1-based page number; for PPTX, a slide number.
+    For other supported files use page=1. Follow next_offset/next_page
+    until has_more=false. Visual elements are reported but never falsely
+    represented as fully extracted text.
     """
-    try:
+    from unisync.mcp.retrieval import read_academic_file
+    if course:
         from unisync.core.path_service import get_path_service
-        user_root = get_path_service().get_user_root()
-    except Exception:
-        user_root = Path("data")
-
-    target = Path(file_path)
-    if not target.is_absolute():
-        if (user_root / file_path).exists():
-            target = user_root / file_path
-        elif Path(file_path).exists():
-            target = Path(file_path)
-        elif (user_root / "workspace" / file_path).exists():
-            target = user_root / "workspace" / file_path
-        elif (user_root / "courses" / file_path).exists():
-            target = user_root / "courses" / file_path
+        scoped_code = resolve_course(course)
+        root = get_path_service().get_user_root().resolve()
+        supplied = Path(file_path)
+        candidate = supplied.resolve() if supplied.is_absolute() else (root / supplied).resolve()
+        course_root = root / "courses"
+        subtitle_root = root / "cache" / "echo360_subtitles"
+        if candidate.is_relative_to(course_root):
+            rel_parts = candidate.relative_to(course_root).parts
+            valid = bool(rel_parts and matches_course(rel_parts[0], scoped_code))
+        elif candidate.is_relative_to(subtitle_root):
+            valid = lecture_course(candidate.name) == scoped_code
         else:
-            fname = Path(file_path).name
-            found = list((user_root / "courses").glob(f"**/{fname}"))
-            if found:
-                target = found[0]
-            else:
-                target = user_root / file_path
-
-    if not target.exists() or not target.is_file():
-        return json.dumps({"error": f"File not found on disk: {file_path}"})
-
-    suffix = target.suffix.lower()
-
-    # 1. PDF Document Extraction
-    if suffix == ".pdf":
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(str(target))
-            extracted = []
-            for i, page in enumerate(reader.pages):
-                txt = page.extract_text() or ""
-                if txt.strip():
-                    extracted.append(f"--- Page {i + 1} ---\n{txt.strip()}")
-                if sum(len(p) for p in extracted) >= max_chars:
-                    break
-            full_text = filter_academic_boilerplate("\n\n".join(extracted))
-            if not full_text:
-                full_text = "(PDF contains scanned images or filtered boilerplate)"
-            truncated = len(full_text) > max_chars
-            return json.dumps({
-                "file": target.name,
-                "file_type": "pdf",
-                "total_pages": len(reader.pages),
-                "truncated": truncated,
-                "content": full_text[:max_chars],
-            }, indent=2)
-        except Exception as exc:
-            return json.dumps({"error": f"Failed to extract PDF text: {exc}"})
-
-    # 2. Word Document (.docx) Extraction
-    if suffix == ".docx":
-        try:
-            import docx
-            doc = docx.Document(str(target))
-            lines: list[str] = []
-            for p in doc.paragraphs:
-                txt = p.text.strip()
-                if not txt:
-                    continue
-                style_name = p.style.name.lower() if p.style else ""
-                if "heading 1" in style_name:
-                    lines.append(f"# {txt}")
-                elif "heading 2" in style_name:
-                    lines.append(f"## {txt}")
-                elif "heading 3" in style_name:
-                    lines.append(f"### {txt}")
-                elif "title" in style_name:
-                    lines.append(f"# {txt}")
-                else:
-                    lines.append(txt)
-            for t in doc.tables:
-                # Omit AI declaration tables/cover page boxes from template extraction
-                table_text = " ".join(c.text.strip().lower() for row in t.rows for c in row.cells)
-                if any(kw in table_text for kw in ("ai use declaration", "ai usage declaration", "generative ai declaration", "declaration of originality")):
-                    continue
-                for row in t.rows:
-                    row_txt = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
-                    if row_txt:
-                        lines.append(row_txt)
-            full_text = filter_academic_boilerplate("\n\n".join(lines))
-            if not full_text:
-                full_text = "(Document appears to be empty or image-only)"
-            truncated = len(full_text) > max_chars
-            return json.dumps({
-                "file": target.name,
-                "file_type": "docx",
-                "paragraphs_count": len(doc.paragraphs),
-                "tables_count": len(doc.tables),
-                "truncated": truncated,
-                "content": full_text[:max_chars],
-            }, indent=2)
-        except Exception as exc:
-            return json.dumps({"error": f"Failed to extract DOCX text: {exc}"})
-
-    # 3. PowerPoint (.pptx) Extraction
-    if suffix == ".pptx":
-        try:
-            import pptx
-            prs = pptx.Presentation(str(target))
-            slides_text = []
-            for i, slide in enumerate(prs.slides):
-                slide_txts = [shape.text.strip() for shape in slide.shapes if shape.has_text_frame and shape.text.strip()]
-                if slide_txts:
-                    slides_text.append(f"--- Slide {i + 1} ---\n" + "\n".join(slide_txts))
-                if sum(len(s) for s in slides_text) >= max_chars:
-                    break
-            full_text = filter_academic_boilerplate("\n\n".join(slides_text))
-            if not full_text:
-                full_text = "(Presentation contains shapes/images without text)"
-            truncated = len(full_text) > max_chars
-            return json.dumps({
-                "file": target.name,
-                "file_type": "pptx",
-                "total_slides": len(prs.slides),
-                "truncated": truncated,
-                "content": full_text[:max_chars],
-            }, indent=2)
-        except Exception as exc:
-            return json.dumps({"error": f"Failed to extract PPTX text: {exc}"})
-
-    # 4. Plain Text / Markdown / Code / Subtitle Files
+            valid = False
+        if not valid:
+            return json.dumps({"error": "File is not confirmed to belong to the requested subject"})
     try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-        clean_text = filter_academic_boilerplate(raw)
-        truncated = len(clean_text) > max_chars
-        return json.dumps({
-            "file": target.name,
-            "file_type": suffix.lstrip(".") or "text",
-            "truncated": truncated,
-            "content": clean_text[:max_chars],
-        }, indent=2)
-    except Exception as exc:
-        return json.dumps({"error": f"Failed to read file: {exc}"})
+        return json.dumps(read_academic_file(
+            file_path, max_chars=max_chars, offset=offset, page=page
+        ), ensure_ascii=False, indent=2)
+    except (OSError, ValueError, PermissionError) as exc:
+        return json.dumps({"error": str(exc), "access": "UniSync academic data only"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool 5: Search Lecture Transcripts
+# Tool 5: Spoken Lecture Search
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -1075,6 +1042,7 @@ def unisync_search_lectures(
     query: str,
     course: str | None = None,
     limit: int = 5,
+    offset: int = 0,
 ) -> str:
     """Search recorded lecture transcripts across all subjects with timestamps and context cues.
 
@@ -1109,10 +1077,15 @@ def unisync_search_lectures(
             "note": "No downloaded subtitle files found.",
         })
 
+    scoped_code = resolve_course(course)
+    catalog = known_courses()
     terms = [t.lower() for t in query.split() if t.strip()]
     matches = []
 
     for f in vtt_files:
+        owner = lecture_course(f.name, catalog=catalog)
+        if scoped_code and owner != scoped_code:
+            continue
         # Extract date from filename: e.g. ..._2026-08-25T17_05_00...
         date_match = re.search(r"(\d{4}-\d{2}-\d{2})", f.name)
         lec_date = date_match.group(1) if date_match else "Unknown Date"
@@ -1144,6 +1117,8 @@ def unisync_search_lectures(
 
         if matched_cues:
             matches.append({
+                "course_code": owner,
+                "course": catalog[owner]["full_title"] if owner else "UNCLASSIFIED",
                 "lecture_date": lec_date,
                 "file_id": f.stem,
                 "hit_count": len(matched_cues),
@@ -1155,8 +1130,11 @@ def unisync_search_lectures(
 
     return json.dumps({
         "query": query,
+        "course_filter": scoped_code,
         "total_lectures_matched": len(matches),
-        "results": matches[:limit],
+        "offset": offset,
+        "next_offset": offset + limit if offset + limit < len(matches) else None,
+        "results": matches[offset:offset + limit],
     }, indent=2)
 
 
@@ -1168,6 +1146,8 @@ def unisync_search_lectures(
 def unisync_get_lecture_transcript(
     lecture_date_or_id: str,
     max_chars: int = 12000,
+    offset: int = 0,
+    course: str | None = None,
 ) -> str:
     """Retrieve the full spoken transcript of a specific recorded university lecture.
 
@@ -1188,10 +1168,23 @@ def unisync_get_lecture_transcript(
         return json.dumps({"error": "No subtitles directory found."})
 
     target = lecture_date_or_id.strip()
-    candidates = [f for f in vtt_dir.glob("*.vtt") if target in f.name]
-    candidates.sort(key=lambda x: x.stat().st_size, reverse=True)
-    if candidates:
-        matched_file = candidates[0]
+    scoped_code = resolve_course(course)
+    catalog = known_courses()
+    files = list(vtt_dir.glob("*.vtt"))
+    stem = target[:-4] if target.lower().endswith(".vtt") else target
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stem):
+        candidates = [f for f in files if stem in f.name]
+    else:
+        candidates = [f for f in files if f.stem == stem]
+    if scoped_code:
+        candidates = [f for f in candidates if lecture_course(f.name, catalog=catalog) == scoped_code]
+    if len(candidates) > 1:
+        return json.dumps({
+            "error": "Ambiguous date: several lecture recordings match. Use an exact file_id from unisync_search_lectures or specify course.",
+            "candidate_count": len(candidates),
+            "candidates": [{"file_id": f.stem, "course_code": lecture_course(f.name, catalog=catalog)} for f in candidates[:15]],
+        })
+    matched_file = candidates[0] if candidates else None
 
     if not matched_file:
         return json.dumps({
@@ -1212,12 +1205,21 @@ def unisync_get_lecture_transcript(
             if clean and not is_academic_boilerplate_cue(clean):
                 lines.append(f"[{start}] {clean}")
 
-        joined = filter_academic_boilerplate("\n".join(lines))
-        truncated = len(joined) > max_chars
+        joined = scrub_text(filter_academic_boilerplate("\n".join(lines)))
+        if not (128 <= max_chars <= 40000) or not (0 <= offset <= len(joined)):
+            return json.dumps({"error": "max_chars must be 128..40000 and offset within the scrubbed transcript"})
+        next_offset = offset + max_chars if offset + max_chars < len(joined) else None
         return json.dumps({
             "file": matched_file.name,
-            "truncated": truncated,
-            "transcript": joined[:max_chars],
+            "course_code": lecture_course(matched_file.name, catalog=catalog),
+            "offset": offset,
+            "total_chars": len(joined),
+            "returned_chars": len(joined[offset:offset + max_chars]),
+            "next_offset": next_offset,
+            "has_more": next_offset is not None,
+            "truncated": next_offset is not None,
+            "transcript": joined[offset:offset + max_chars],
+            "scrubber": "academic_boilerplate+credential_redaction",
         }, indent=2)
     except Exception as exc:
         return json.dumps({"error": f"Failed reading transcript: {exc}"})
@@ -1232,6 +1234,7 @@ def unisync_search_announcements(
     query: str,
     course: str | None = None,
     limit: int = 10,
+    offset: int = 0,
 ) -> str:
     """Search university subject announcements, Canvas notices, email updates, and instructor posts.
 
@@ -1251,6 +1254,7 @@ def unisync_search_announcements(
     except Exception:
         user_root = Path("data")
 
+    scoped_code = resolve_course(course)
     q_clean = query.lower().strip()
     raw_terms = [w for w in re.split(r"[\s_\-]+", q_clean) if w]
     expanded_terms = set(raw_terms)
@@ -1289,7 +1293,7 @@ def unisync_search_announcements(
         for page_file in courses_dir.glob("*/pages/*.md"):
             try:
                 c_name = page_file.parent.parent.name
-                if course and course.lower() not in c_name.lower():
+                if not matches_course(c_name, scoped_code):
                     continue
 
                 raw = page_file.read_text(encoding="utf-8", errors="replace")
@@ -1340,7 +1344,7 @@ def unisync_search_announcements(
     try:
         from unisync.services.email_monitor.store import EmailMonitorStore
         store = EmailMonitorStore()
-        entries = store.get_ledger_entries(limit=250)
+        entries = store.get_ledger_entries(limit=10**9)
         for entry in entries:
             subject = entry.subject or ""
             searchable = f"{subject} {entry.ledger_id}".lower()
@@ -1369,8 +1373,13 @@ def unisync_search_announcements(
                 except Exception:
                     pass
 
-            if course and course.lower() not in searchable:
-                continue
+            # An email mentioning another course in its body does not establish
+            # ownership. For scoped searches, require an unambiguous subject code
+            # in the email's subject line; otherwise leave it in unscoped results.
+            if scoped_code:
+                owned = {m.group(1).upper() for m in CODE_RE.finditer(subject)}
+                if owned != {scoped_code}:
+                    continue
 
             score = 0
             if q_clean in searchable:
@@ -1388,7 +1397,7 @@ def unisync_search_announcements(
                     "id": entry.ledger_id,
                     "date": datetime.fromtimestamp(entry.processed_at, tz=timezone.utc).isoformat() if entry.processed_at else "",
                     "sender": sender_display,
-                    "course": course or "University Notice",
+                    "course": scoped_code or "University Notice",
                     "subject": subject,
                     "snippet": snippet or f"Processed email ({entry.status})",
                     "source": "email",
@@ -1398,11 +1407,13 @@ def unisync_search_announcements(
 
     # Sort descending by score
     scored.sort(key=lambda x: x[0], reverse=True)
-    results = [item for _, item in scored][:limit]
+    results = [item for _, item in scored][offset:offset + limit]
 
     return json.dumps({
         "query": query,
         "total_matched": len(scored),
+        "offset": offset,
+        "next_offset": offset + limit if offset + limit < len(scored) else None,
         "announcements": results,
         "note": "No matching announcements or notifications found." if not results else "",
     }, indent=2)
@@ -1596,6 +1607,7 @@ def unisync_search(
         - announcements: Canvas announcements and instructor emails
         - semantic_passages: High-confidence semantic matches across all indexed course files
     """
+    scoped_code = resolve_course(course)
     q_clean = query.lower().strip()
     terms = [w for w in re.split(r"[\s_\-]+", q_clean) if w]
 
@@ -1606,7 +1618,7 @@ def unisync_search(
         svc = get_todo_service()
         items = svc.list_items()
         for t in items:
-            if course and course.lower() not in (t.course or "").lower():
+            if not matches_course(t.course, scoped_code):
                 continue
             t_title = (t.title or "").lower()
             t_notes = (t.notes or "").lower()
@@ -1633,7 +1645,7 @@ def unisync_search(
     # 2. Course Materials & Slides
     matched_materials: list[dict[str, Any]] = []
     try:
-        raw_mat = json.loads(unisync_search_course_materials(query=query, course=course, limit=limit, search_content=True))
+        raw_mat = json.loads(unisync_search_course_materials(query=query, course=scoped_code, limit=limit, search_content=True))
         matched_materials = raw_mat.get("files", [])
     except Exception as _e:
         logger.debug("unisync_search materials lookup error: %s", _e)
@@ -1641,7 +1653,7 @@ def unisync_search(
     # 3. Spoken Lecture Transcripts
     matched_lectures: list[dict[str, Any]] = []
     try:
-        raw_lec = json.loads(unisync_search_lectures(query=query, course=course, limit=limit))
+        raw_lec = json.loads(unisync_search_lectures(query=query, course=scoped_code, limit=limit))
         matched_lectures = raw_lec.get("results", [])
     except Exception as _e:
         logger.debug("unisync_search lectures lookup error: %s", _e)
@@ -1649,7 +1661,7 @@ def unisync_search(
     # 4. Canvas Announcements & Emails
     matched_announcements: list[dict[str, Any]] = []
     try:
-        raw_ann = json.loads(unisync_search_announcements(query=query, course=course, limit=limit))
+        raw_ann = json.loads(unisync_search_announcements(query=query, course=scoped_code, limit=limit))
         matched_announcements = raw_ann.get("announcements", [])
     except Exception as _e:
         logger.debug("unisync_search announcements lookup error: %s", _e)
@@ -1660,7 +1672,7 @@ def unisync_search(
         from unisync.services.kb import get_kb_service
         with redirect_stdout(sys.stderr):
             kb = get_kb_service()
-            kb_results = kb.search(query=query, course=course, limit=limit)
+            kb_results = kb.search(query=query, course=scoped_code, limit=limit)
         for kr in kb_results:
             matched_passages.append({
                 "file": kr.get("file_name") or Path(kr.get("file_path", "")).name,
@@ -1683,7 +1695,7 @@ def unisync_search(
 
     return json.dumps({
         "query": query,
-        "course_filter": course,
+        "course_filter": scoped_code,
         "total_results": total_hits,
         "results": {
             "assignments": matched_assignments,
@@ -1958,6 +1970,69 @@ async def unisync_notebooklm_add_note(
     except Exception as exc:
         logger.exception("Failed adding note to NotebookLM for %s", course)
         return json.dumps({"error": f"Failed adding note: {exc}"}, indent=2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Durable, user-private cross-chat agent workspace (local text only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def unisync_agent_workspace_list(
+    category: str = "all", limit: int = 50, offset: int = 0
+) -> str:
+    """Discover previous agents' drafts, notes, handoffs, and reports.
+
+    At the beginning of a new chat or agent run, call this tool to find existing
+    work. Categories: all, drafts, handoffs, notes, reports, artifacts. Results
+    include SHA-256 revision identifiers. Follow next_offset to list everything.
+    Files live only under UniSync's Git-ignored private workspace, not Canvas.
+    """
+    from unisync.mcp.agent_workspace import list_files
+    try:
+        return json.dumps(list_files(category=category, limit=limit, offset=offset), ensure_ascii=False)
+    except (OSError, ValueError, PermissionError) as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def unisync_agent_workspace_read(
+    path: str, offset: int = 0, max_chars: int = 8000
+) -> str:
+    """Read a persisted draft, handoff, note, or report for continuity across chats.
+
+    Use a path returned by unisync_agent_workspace_list (e.g.
+    'handoffs/START_HERE.md' or 'drafts/BLAW10001/final-outline.md').
+    Follow next_offset to retrieve the ENTIRE SCRUBBED text without truncation.
+    This never reads arbitrary laptop paths or LMS credentials.
+    """
+    from unisync.mcp.agent_workspace import read_file
+    try:
+        return json.dumps(read_file(path, offset=offset, max_chars=max_chars), ensure_ascii=False)
+    except (OSError, ValueError, PermissionError, UnicodeError) as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def unisync_agent_workspace_save(
+    path: str, content: str, expected_sha256: str | None = None
+) -> str:
+    """Save a persistent private draft or agent-to-agent handoff.
+
+    Use paths under drafts/, handoffs/, notes/, reports/, artifacts/ with
+    .md/.txt/.json/.csv extension. Creation needs no revision argument.
+    To UPDATE an existing document, first read it and pass its sha256 as
+    expected_sha256 to prevent lost edits. Old versions are backed up.
+    Refuses likely credentials and out-of-scope paths. Saving is NOT
+    submission to Canvas, external publishing, or email sending.
+    """
+    from unisync.mcp.agent_workspace import save_file
+    try:
+        return json.dumps(
+            save_file(path, content, expected_sha256=expected_sha256),
+            ensure_ascii=False,
+        )
+    except (OSError, ValueError, PermissionError, UnicodeError) as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
