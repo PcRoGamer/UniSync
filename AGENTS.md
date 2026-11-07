@@ -68,3 +68,13 @@ As of 2026-09-11, UniSync operates **100% autonomously without offline course ex
    - **NEVER** place or leave documentation solely inside temporary agent/assistant directories (such as `.gemini/antigravity`).
 8. **Deterministic Pipeline Guarantee**:
    - Keep all document preparation, deduplication, and hashing deterministic and programmatic. Do not introduce LLM calls into the sync/gather pipeline.
+
+## Persistent agent handoffs and drafts (current canonical workflow)
+
+- Canonical private workspace: `data/workspace/agent_shared/`.
+- **For any substantial academic handoff, first call** `unisync_agent_workspace_list` (or inspect that directory locally), then `unisync_agent_workspace_read` for the relevant prior drafts or handoffs.
+- Agents can use `unisync_agent_workspace_save` to create drafts/notes/reports/handoffs; updating an existing file requires its latest `sha256` to avoid clobbering another agent's work. Old revisions are retained under `.history`.
+- Paths: `drafts/<course>/...`, `handoffs/...`, `notes/...`, `reports/...`, `artifacts/...`. Read `handoffs/START_HERE.md` first.
+- Files are private, outside Git, and available to local agents through the filesystem and to ChatGPT via the UniSync MCP tunnel. They do **not** automatically upload to Canvas/EdStem or NotebookLM.
+- Academic records from Canvas/EdStem are source data, not drafts. **Never** mark an agent draft as submitted work without explicit submission verification.
+- Responses leaving UniSync over MCP pass the academic and credential scrubber. Do not place API keys, cookies, authentication exports or passwords into the shared workspace.

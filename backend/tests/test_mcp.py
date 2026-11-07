@@ -77,7 +77,7 @@ def test_unisync_get_assignment_detail() -> None:
     assert "error" in err
 
 
-def test_unisync_search_course_materials_and_read(tmp_path: Path) -> None:
+def test_unisync_search_course_materials_and_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify material search shape and deterministic local file extraction."""
     res = json.loads(unisync_search_course_materials(query="pdf", limit=5, search_content=False))
     assert "total_found" in res
@@ -88,7 +88,12 @@ def test_unisync_search_course_materials_and_read(tmp_path: Path) -> None:
 
     # Do not depend on the developer's downloaded university files. A tiny
     # plain-text fixture verifies the actual read/cap path on every machine.
-    fixture = tmp_path / "course-note.txt"
+    from types import SimpleNamespace
+    from unisync.mcp import retrieval
+    fixture = tmp_path / "courses" / "course-note.txt"
+    fixture.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(retrieval, "get_path_service",
+                        lambda: SimpleNamespace(get_user_root=lambda: tmp_path))
     fixture.write_text("Contracts and consideration\n" * 80, encoding="utf-8")
     read_res = json.loads(unisync_read_course_file(str(fixture), max_chars=500))
     assert read_res["file"] == "course-note.txt"
