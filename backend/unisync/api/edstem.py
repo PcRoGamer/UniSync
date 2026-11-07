@@ -131,6 +131,7 @@ def sync_edstem_course_todos(
     course_id: str,
     course_name: str | None = None,
     snapshot: Any = None,
+    verified_grades: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Sync lessons for an EdStem course into TodoService with submission statuses.
 
@@ -151,7 +152,7 @@ def sync_edstem_course_todos(
             announcements=[],
             fetched_at="",
         )
-    due_items = extract_due_items(snapshot)
+    due_items = extract_due_items(snapshot, verified_grades=verified_grades)
 
     todo_svc = get_todo_service()
     c_name = course_name or str(course_id)
@@ -164,8 +165,10 @@ def sync_edstem_course_todos(
         s_id = f"edstem:{course_id}:{d['id']}"
         matches = [
             t for t in existing_todos
-            if getattr(t, "source_id", None) == s_id
-            or (t.title == d["title"] and (t.course == c_name or "Foundations of Computing" in (t.course or "")))
+            if (getattr(t, "source", None) == "edstem" and (
+                getattr(t, "source_id", None) == s_id
+                or (t.title == d["title"] and t.course == c_name)
+            ))
         ]
 
         todo_payload = {
@@ -202,7 +205,9 @@ def sync_edstem_course_todos(
                     "points_possible": d["points_possible"],
                     "grade": d["grade"],
                     "grading_type": d["grading_type"],
+                    "submitted_at": d["submitted_at"],
                     "url": d["url"],
+                    "status": d["status"],
                 }
                 if d["status"] == "done":
                     update_fields["status"] = "done"
@@ -373,8 +378,18 @@ def sync_edstem_course_full(
         except Exception as dl_err:
             logger.warning("Failed downloading EdStem resource %s: %s", clean_fname, dl_err)
 
-    # 4. Synchronize deadlines and grades into TodoService
-    due_res = sync_edstem_course_todos(client, c_id_str, c_title, snapshot=snapshot)
+    # 4. Retrieve the account owner's submitted attempts and actual grades.
+    # A completed Ed lesson alone is NOT evidence of a grade or submission.
+    from unisync.services.edstem.submissions import archive_edstem_assessments
+    try:
+        verified = archive_edstem_assessments(client, snapshot.lessons, course_base)
+    except EdStemError as exc:
+        logger.warning("Ed assessments unavailable (%s); grades remain unverified", exc.kind)
+        verified = {"grades_by_lesson": {}, "summary": {"error_kind": exc.kind}}
+    due_res = sync_edstem_course_todos(
+        client, c_id_str, c_title, snapshot=snapshot,
+        verified_grades=verified["grades_by_lesson"],
+    )
 
     # 5. Persist snapshot state in data/libraries/edstem_snapshots.json
     if persist_snapshot:
@@ -392,6 +407,7 @@ def sync_edstem_course_full(
                 "course": snapshot.course,
                 "kb_name": kb_name,
                 "doc_count": written_docs,
+                "assessment_archive": verified["summary"],
                 "counts": {
                     "modules": len(snapshot.modules),
                     "lessons": len(snapshot.lessons),
@@ -418,12 +434,15 @@ def sync_edstem_course_full(
         except Exception as kb_err:
             logger.debug("Failed triggering background KB index after EdStem sync: %s", kb_err)
 
-    # 7. Auto-trigger on-disk scrubber in background for this course
-    try:
-        from unisync.services.disk_cleaner import run_background_disk_scrubber
-        run_background_disk_scrubber(target_path=course_base, delay_sec=1.0)
-    except Exception as scrub_err:
-        logger.debug("Failed triggering background disk scrubber after EdStem sync: %s", scrub_err)
+    # Keep original Ed submissions and grading unmodified on disk when the
+    # operator selected response-level MCP scrubbing.
+    import os
+    if os.environ.get("UNISYNC_SKIP_DISK_SCRUB") != "1":
+        try:
+            from unisync.services.disk_cleaner import run_background_disk_scrubber
+            run_background_disk_scrubber(target_path=course_base, delay_sec=1.0)
+        except Exception as scrub_err:
+            logger.debug("Failed triggering background disk scrubber after EdStem sync: %s", scrub_err)
 
 
     return {
@@ -435,6 +454,7 @@ def sync_edstem_course_full(
         "due_items_count": due_res.get("due_items_count", 0),
         "created_todos": due_res.get("created_count", 0),
         "updated_todos": due_res.get("updated_count", 0),
+        "assessment_archive": verified["summary"],
         "counts": {
             "modules": len(snapshot.modules),
             "lessons": len(snapshot.lessons),
