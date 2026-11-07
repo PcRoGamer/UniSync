@@ -18,15 +18,17 @@ def approved(tmp_path, monkeypatch):
     root.mkdir()
     grant = tmp_path / "private" / "grant.json"
     monkeypatch.setenv("UNISYNC_WORKSTATION_GRANT_FILE", str(grant))
+    monkeypatch.setenv("UNISYNC_APPROVAL_REQUEST_DIR", str(tmp_path / "no-broker"))
     grant.parent.mkdir()
     grant.write_text(json.dumps({"schema": 1, "root": str(root),
-                                 "permissions": ["read", "write", "run"],
+                                 "permissions": ["read", "write"],
                                  "expires_at": time.time() + 600}))
     return root, grant
 
 
 def test_grant_required(tmp_path, monkeypatch):
     monkeypatch.setenv("UNISYNC_WORKSTATION_GRANT_FILE", str(tmp_path / "nope.json"))
+    monkeypatch.setenv("UNISYNC_APPROVAL_REQUEST_DIR", str(tmp_path / "no-broker"))
     assert not ws.host_status()["enabled"]
     with pytest.raises(ws.WorkstationError):
         ws.host_list(".")
@@ -83,10 +85,57 @@ def test_expired_and_scoped_grants(approved):
 
 
 def test_run_argv_without_shell(approved):
+    root, _ = approved
+    ws._run_grant_path().write_text(json.dumps({"schema": 1, "root": str(root),
+                                                "permissions": ["run"],
+                                                "expires_at": time.time() + 60}))
     result = ws.host_run([sys.executable, "-c", "print('mcp-ok')"], timeout_seconds=5)
     assert result["exit_code"] == 0
     assert result["stdout"].strip() == "mcp-ok"
     assert result["stderr"] == ""
+
+
+def test_run_requires_a_separate_expiring_grant(approved):
+    root, grant = approved
+    grant.write_text(json.dumps({"schema": 1, "root": str(root),
+                                 "permissions": ["read", "write", "run"],
+                                 "expires_at": time.time() + 600}))
+    with pytest.raises(ws.WorkstationError):
+        ws.host_run([sys.executable, "--version"])
+
+    run_grant = ws._run_grant_path()
+    run_grant.write_text(json.dumps({"schema": 1, "root": str(root),
+                                     "permissions": ["run"],
+                                     "expires_at": time.time() + 60}))
+    result = ws.host_run([sys.executable, "-c", "print('separate-run-ok')"], timeout_seconds=5)
+    assert result["stdout"].strip() == "separate-run-ok"
+    assert ws.host_status()["run_expires_at"] > time.time()
+
+
+def test_run_output_is_bounded(approved):
+    root, _ = approved
+    ws._run_grant_path().write_text(json.dumps({"schema": 1, "root": str(root),
+                                                "permissions": ["run"],
+                                                "expires_at": time.time() + 60}))
+    result = ws.host_run([sys.executable, "-c", "print('x' * 50000)"], timeout_seconds=5)
+    assert result["exit_code"] == 0
+    assert len(result["stdout"].encode("utf-8")) <= ws.MAX_OUTPUT_BYTES
+    assert result["stdout_truncated"]
+
+
+def test_drive_relative_and_alternate_data_stream_paths_are_denied(approved):
+    with pytest.raises(ws.WorkstationError):
+        ws.host_read("C:outside.txt")
+    with pytest.raises(ws.WorkstationError):
+        ws.host_read("notes.txt:secret")
+
+
+def test_secret_markers_are_denied(approved):
+    root, _ = approved
+    for name in ("access-token.txt", "auth_state.json", "private_key.pem"):
+        (root / name).write_text("private")
+        with pytest.raises(ws.WorkstationError):
+            ws.host_read(name)
 
 
 def test_symlink_outside_root_denied(approved, tmp_path):
@@ -135,6 +184,18 @@ def test_only_one_text_match_may_be_replaced(approved):
     with pytest.raises(ws.WorkstationError):
         ws.host_replace("app.py", "same", "other", digest)
     assert (root / "app.py").read_text() == "same same"
+
+
+def test_large_write_and_replacement_inputs_are_rejected(approved):
+    root, _ = approved
+    with pytest.raises(ws.WorkstationError):
+        ws.host_write("large.txt", "x" * (ws.MAX_WRITE_BYTES + 1))
+    target = root / "small.txt"
+    target.write_text("a")
+    digest = ws.host_read("small.txt")["sha256"]
+    with pytest.raises(ws.WorkstationError):
+        ws.host_replace("small.txt", "a", "x" * 8_000_001, digest)
+    assert target.read_text() == "a"
 
 
 def test_expired_grant_does_not_reactivate(approved):
