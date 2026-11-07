@@ -143,7 +143,7 @@ def test_due_items_use_stable_lesson_ids() -> None:
     assert items[0]["id"] == "lesson-7"
     assert items[0]["title"] == "Assignment"
     assert items[0]["due_at"] == "2026-09-01T00:00:00Z"
-    assert items[0]["submission_status"] == "unsubmitted"
+    assert items[0]["submission_status"] == "not_applicable"
     assert items[0]["status"] == "open"
     assert items[0]["url"] == "https://edstem.org/au/courses/36892/lessons/lesson-7"
 
@@ -181,16 +181,16 @@ def test_due_items_extracts_submission_and_points() -> None:
     # Completed item
     assert items[0]["id"] == "114327"
     assert items[0]["status"] == "done"
-    assert items[0]["submission_status"] == "submitted"
+    assert items[0]["submission_status"] == "not_applicable"
     assert items[0]["is_completed"] is True
-    assert items[0]["is_graded"] is True
+    assert items[0]["is_graded"] is False
     assert items[0]["points_possible"] == 2.0
-    assert items[0]["score"] == 2.0
+    assert items[0]["score"] is None
 
     # In-progress item
     assert items[1]["id"] == "114328"
     assert items[1]["status"] == "open"
-    assert items[1]["submission_status"] == "pending_review"
+    assert items[1]["submission_status"] == "not_applicable"
     assert items[1]["is_completed"] is False
     assert items[1]["points_possible"] == 3.0
     assert items[1]["score"] is None

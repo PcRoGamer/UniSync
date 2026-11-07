@@ -337,6 +337,20 @@ class EdStemClient:
         else:  # pragma: no cover - defensive
             raise EdStemError(f"Could not reach EdStem: {last_error}", kind="network")
 
+        if response.status_code == 403:
+            # A student's submitted work may exist while staff have not
+            # released the grade. Ed returns code=results_unreleased; this
+            # is NOT an authentication failure and must not be logged as one.
+            try:
+                denied = _as_record(response.json())
+                ed_code = _string(denied.get("code") or denied.get("error"))
+            except (ValueError, TypeError):
+                ed_code = ""
+            if ed_code == "results_unreleased":
+                raise EdStemError(
+                    "EdStem has not released the marking result.",
+                    status_code=403, kind="unreleased",
+                )
         if response.status_code in {401, 403}:
             raise EdStemError("EdStem API token was rejected or has expired.", status_code=response.status_code, kind="auth")
         if response.status_code == 404:
@@ -419,6 +433,41 @@ class EdStemClient:
                 raise
             payload = self._request(f"courses/{course_id}/files")
         return [normalize_resource(item, index) for index, item in enumerate(_collection(payload, "resources", "files", "items"))]
+
+    def fetch_own_lesson_attempts(self, lesson_id: str, user_id: str) -> dict[str, Any]:
+        """Read-only Ed final attempt and attempt history for authenticated user."""
+        payload = _as_record(self._request(f"lessons/{quote(str(lesson_id), safe='')}/attempts/{quote(str(user_id), safe='')}"))
+        attempts = [
+            dict(a) for a in _collection(payload, "attempts")
+            if _id(a.get("user_id")) == str(user_id)
+        ]
+        final = _id(payload.get("final_id"))
+        return {"final_id": final, "attempts": attempts}
+
+    def fetch_own_marking_status(self, lesson_id: str, attempt_id: str, user_id: str) -> dict[str, Any]:
+        """Read-only staff/auto marks, refusing results for other students.
+
+        Ed returns a specific 403 results_unreleased when staff have not
+        released the student's grades; that is not an expired login token.
+        """
+        result = _as_record(self._request(
+            f"lessons/{quote(str(lesson_id), safe='')}/marking_status",
+            params={"attempt": str(attempt_id)},
+        ))
+        own = _as_record(result.get("attempt_result"))
+        if _id(own.get("user_id")) != str(user_id):
+            raise EdStemError("Marking result is not for the authenticated user.", kind="security")
+        return result
+
+    def fetch_own_slide_responses(self, slide_id: str, user_id: str) -> list[dict[str, Any]]:
+        """Fetch saved quiz answers without starting or submitting an attempt."""
+        payload = self._request(
+            f"lessons/slides/{quote(str(slide_id), safe='')}/questions/responses"
+        )
+        return [
+            dict(item) for item in _collection(payload, "responses")
+            if _id(item.get("user_id")) == str(user_id)
+        ]
 
     def fetch_threads(self, course_id: str, *, max_items: int = 500) -> list[dict[str, Any]]:
         threads: list[dict[str, Any]] = []
@@ -657,70 +706,76 @@ def render_snapshot(snapshot: EdStemSnapshot, course_id: str) -> list[tuple[str,
     return docs
 
 
-def extract_due_items(snapshot: EdStemSnapshot) -> list[dict[str, Any]]:
-    """Return lesson/activity records with due dates and submission statuses for todo synchronization.
+def extract_due_items(
+    snapshot: EdStemSnapshot,
+    verified_grades: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return Ed lesson progress and VERIFIED grades without inventing marks.
 
-    Zero-LLM programmatic parser that checks interactive lesson completion states
-    (e.g. 'completed', 'attempted', 'unattempted') and extracts points possible
-    from titles and metadata to populate student progress tracking.
+    A completed reading, slide or interactive lesson is not necessarily a
+    submission and NEVER proves full marks. Grades are only taken from the
+    authenticated student's actual Ed attempt/marking API.
     """
     import re
     import time
+    verified = verified_grades or {}
     items: list[dict[str, Any]] = []
     for lesson in snapshot.lessons:
         due_at = _string(lesson.get("due_at") or lesson.get("effective_due_at") or lesson.get("deadline"))
         title = _string(lesson.get("title") or lesson.get("name"))
         if not (due_at and title):
             continue
-
-        # Check completion and attempt states on the lesson
+        lesson_id = _id(lesson.get("id")) or title
+        kind = _string(lesson.get("kind")).lower()
+        actual_attempt_lesson = kind == "attempt"
         raw_status = _string(lesson.get("status")).lower()
-        submitted_at = lesson.get("submitted_at")
-        is_completed = (raw_status == "completed") or (submitted_at is not None)
-        is_attempted = (raw_status == "attempted") or (lesson.get("attempt_id") is not None)
-
-        # Parse points possible from title e.g. 'More operators (2 points)' or lesson attributes
-        pts = None
-        m = re.search(r"\((\d+(?:\.\d+)?)\s*points?\)", title, re.IGNORECASE)
-        if m:
-            try:
-                pts = float(m.group(1))
-            except Exception:
-                pass
-        elif lesson.get("points") is not None:
-            try:
-                pts = float(lesson.get("points"))
-            except Exception:
-                pass
-
-        # Map EdStem lifecycle to standard UniSync submission statuses
-        if is_completed:
-            task_status = "done"
+        is_completed = raw_status == "completed"
+        evidence = verified.get(lesson_id) if actual_attempt_lesson else None
+        evidence = evidence if isinstance(evidence, dict) else {}
+        evidence_status = _string(evidence.get("status"))
+        submitted_at = evidence.get("submitted_at") or lesson.get("submitted_at")
+        # "completed" is an LMS progress state, not a grade or submission.
+        task_status = "done" if is_completed else "open"
+        if not actual_attempt_lesson:
+            sub_status = "not_applicable"
+        elif evidence_status == "graded":
+            sub_status = "graded"
+        elif submitted_at or evidence_status in ("ungraded", "unreleased"):
             sub_status = "submitted"
-        elif is_attempted:
-            task_status = "open"
-            sub_status = "pending_review"
+        elif raw_status == "attempted":
+            sub_status = "in_progress"
         else:
-            task_status = "open"
             sub_status = "unsubmitted"
-
-        item_id = _id(lesson.get("id")) or title
+        # Explicit scoring evidence only; 0 is a legitimate mark.
+        is_graded = actual_attempt_lesson and evidence_status == "graded"
+        score = evidence.get("score") if is_graded else None
+        grade = evidence.get("grade") if is_graded else None
+        pts = evidence.get("points_possible") if is_graded else None
+        # Possible points from the title is a heuristic, never an earned score.
+        if pts is None:
+            m = re.search(r"\((\d+(?:\.\d+)?)\s*points?\)", title, re.IGNORECASE)
+            if m:
+                pts = float(m.group(1))
+            elif lesson.get("points") is not None:
+                try:
+                    pts = float(lesson["points"])
+                except (TypeError, ValueError):
+                    pass
         course_id = _id(lesson.get("course_id"))
-
         items.append({
-            "id": item_id,
+            "id": lesson_id,
             "title": title,
             "due_at": due_at,
             "status": task_status,
             "submission_status": sub_status,
             "is_completed": is_completed,
-            "is_graded": is_completed,  # Ed challenges auto-grade upon all slides completed
+            "is_graded": is_graded,
             "points_possible": pts,
-            "score": pts if is_completed else None,
-            "grade": str(pts) if (is_completed and pts is not None) else None,
-            "grading_type": "points" if pts is not None else None,
-            "submitted_at": submitted_at,
+            "score": score,
+            "grade": grade,
+            "grading_type": "points" if is_graded else None,
+            "submitted_at": submitted_at if actual_attempt_lesson else None,
             "completed_at": time.time() if is_completed else None,
-            "url": f"https://edstem.org/au/courses/{course_id}/lessons/{item_id}",
+            "url": f"https://edstem.org/au/courses/{course_id}/lessons/{lesson_id}",
         })
     return items
