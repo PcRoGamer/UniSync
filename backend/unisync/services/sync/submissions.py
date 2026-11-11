@@ -162,28 +162,31 @@ class SubmissionSync:
             url = attachment.get('url', '')
             if urlparse(url).scheme != 'https':
                 raise ValueError('Attachment requires HTTPS')
-            async with self.client.stream('GET', url, follow_redirects=True) as response:
-                response.raise_for_status()
-                if 'text/html' in response.headers.get('content-type', '').lower():
-                    raise ValueError('Received a login page instead of an attachment')
-                digest = hashlib.sha256()
-                size = 0
-                with temporary.open('wb') as output:
-                    async for block in response.aiter_bytes():
-                        size += len(block)
-                        digest.update(block)
-                        output.write(block)
-                if not size:
-                    raise ValueError('Empty attachment')
-                expected = attachment.get('size')
-                if expected is not None and size != int(expected):
-                    raise ValueError('Incomplete attachment')
-                temporary.replace(path)
+            from unisync.services.sync.gradescope import quiet_http_logs
+            with quiet_http_logs():
+                async with self.client.stream('GET', url, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    if 'text/html' in response.headers.get('content-type', '').lower():
+                        raise ValueError('Received a login page instead of an attachment')
+                    digest = hashlib.sha256()
+                    size = 0
+                    with temporary.open('wb') as output:
+                        async for block in response.aiter_bytes():
+                            size += len(block)
+                            digest.update(block)
+                            output.write(block)
+                    if not size:
+                        raise ValueError('Empty attachment')
+                    expected = attachment.get('size')
+                    if expected is not None and size != int(expected):
+                        raise ValueError('Incomplete attachment')
+                    temporary.replace(path)
             return {'status': 'downloaded', 'path': str(path), 'sha256': digest.hexdigest()}
         except Exception as exc:
             temporary.unlink(missing_ok=True)
-            # URLs may contain signed credentials; retain only the exception type.
-            return {'status': 'failed', 'error': type(exc).__name__}
+            # Signed URLs and cookies stay out of the saved error.
+            from unisync.services.sync.gradescope import safe_public_error
+            return {'status': 'failed', 'error': safe_public_error(exc)}
 
     async def archive(self, course: dict, assignment: dict, submission: dict) -> dict:
         course_name = safe_name(course.get('course_code') or course.get('name') or course['id'])
@@ -261,7 +264,11 @@ class SubmissionSync:
         from unisync.services.sync.gradescope import archive_gradescope
 
         tabs = await self.pages(f'/api/v1/courses/{course["id"]}/tabs?per_page=100')
-        tab = next((tab for tab in tabs if tab.get('label', '').strip().casefold() == 'gradescope'), None)
+        tab = next((
+            tab for tab in tabs
+            if str(tab.get('label') or '').strip().casefold() in {'gradescope'}
+            or str(tab.get('label') or '').strip().casefold().startswith('gradescope ')
+        ), None)
         return await archive_gradescope(self, course, tab) if tab else None
 
     async def run(self, course_id: str | None = None, *, include_gradescope: bool = False) -> dict:
@@ -273,14 +280,25 @@ class SubmissionSync:
             if include_gradescope:
                 try:
                     result = await self.sync_gradescope(course)
-                    if result is not None:
-                        counts.setdefault('gradescope', {})[str(course['id'])] = result
+                    counts.setdefault('gradescope', {})[str(course['id'])] = (
+                        result if result is not None else {'status': 'no_gradescope_tab'}
+                    )
                 except Exception as exc:
-                    counts.setdefault('gradescope', {})[str(course['id'])] = {'error': type(exc).__name__}
+                    from unisync.services.sync.gradescope import safe_public_error
+                    counts.setdefault('gradescope', {})[str(course['id'])] = {'error': safe_public_error(exc)}
             try:
                 assignments = await self.pages(
                     f'/api/v1/courses/{course["id"]}/assignments?per_page=100&include[]=submission&include[]=rubric'
                 )
+                if include_gradescope:
+                    try:
+                        from unisync.services.sync.gradescope import link_canvas_assignments
+                        link_canvas_assignments(self.root, course, assignments)
+                    except Exception as exc:
+                        from unisync.services.sync.gradescope import safe_public_error
+                        info = counts.setdefault('gradescope', {}).setdefault(str(course['id']), {})
+                        if isinstance(info, dict):
+                            info['link_error'] = safe_public_error(exc)
                 for assignment in assignments:
                     summary = assignment.get('submission') or {}
                     if not has_meaningful_assessment(summary):

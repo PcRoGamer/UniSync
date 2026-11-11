@@ -496,7 +496,8 @@ def unisync_get_assignment_detail(
 
     Returns:
         Full assignment details including cleaned instructions, rubric criteria & rating tiers,
-        score, points possible, submission comments, and URLs.
+        score, points possible, submission comments, archived Canvas feedback, Gradescope
+        marks when a local archive matches, and URLs.
     """
     try:
         from unisync.services.todos import get_todo_service
@@ -648,7 +649,7 @@ def unisync_get_assignment_detail(
     sub_iso, _ = _normalize_iso(matched.submitted_at)
     grad_iso, _ = _normalize_iso(matched.graded_at)
 
-    return json.dumps({
+    payload = {
         "id": str(matched.id),
         "title": matched.title,
         "course": matched.course or "University Subject",
@@ -669,7 +670,63 @@ def unisync_get_assignment_detail(
         "specification_source": "EdStem Lesson (Authoritative Written Specification)" if ed_lesson_file else "Canvas LMS",
         "rubric": formatted_rubric,
         "submission_comments": matched.submission_comments or [],
-    }, indent=2)
+    }
+    source_id = str(getattr(matched, "source_id", "") or "")
+    source_match = re.search(r"assignment:(\d+)", source_id)
+    if source_match:
+        canvas_assignment_id = source_match.group(1)
+    else:
+        url_match = re.search(r"/assignments/(\d+)", matched.url or "")
+        canvas_assignment_id = url_match.group(1) if url_match else ""
+    try:
+        from unisync.mcp.egress import scrub
+        from unisync.mcp.submission_archive import load_gradescope_feedback, load_submission_archive
+
+        archive = load_submission_archive(
+            user_root=user_root,
+            course=matched.course or "",
+            canvas_url=matched.url or "",
+            assignment_id=canvas_assignment_id,
+            title=matched.title or "",
+        )
+        gradescope = load_gradescope_feedback(
+            user_root=user_root,
+            course=matched.course or "",
+            assignment=matched.title or canvas_assignment_id,
+            canvas_assignment_id=canvas_assignment_id,
+        )
+        payload["submission_archive"] = archive if archive.get("found") else None
+        payload["gradescope"] = gradescope if gradescope.get("found") else None
+        return json.dumps(scrub(payload), indent=2)
+    except Exception:
+        logger.debug("Assignment archive merge failed")
+        return json.dumps(payload, indent=2)
+
+
+@mcp.tool()
+def unisync_get_gradescope_feedback(course: str, assignment: str) -> str:
+    """Return the signed-in student's archived Gradescope score, rubric items, and marker comments.
+
+    Args:
+        course: Course code, Canvas course id, or course folder (for example 'COMP10001' or '241246').
+        assignment: Assignment title, Canvas assignment id, or Gradescope assignment id.
+
+    Returns:
+        Structured feedback already stored on disk. This does not contact Gradescope.
+    """
+    try:
+        from unisync.core.path_service import get_path_service
+        user_root = get_path_service().get_user_root()
+    except Exception:
+        user_root = Path("data")
+    from unisync.mcp.egress import scrub_json
+    from unisync.mcp.submission_archive import load_gradescope_feedback
+
+    try:
+        payload = load_gradescope_feedback(user_root=user_root, course=course, assignment=assignment)
+    except Exception as exc:
+        payload = {"found": False, "error": type(exc).__name__}
+    return scrub_json(payload)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
