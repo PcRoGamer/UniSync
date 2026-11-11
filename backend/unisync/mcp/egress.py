@@ -11,14 +11,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from unisync.services.sync.echo360_links import is_watch_page
+from unisync.services.sync.echo360_links import _without_secret_query, is_watch_page
 
 _RECORDING_KEYS = {"recording_url", "video_url", "player_url", "classroom_url"}
 
 
 def scrub_recording_url(url: object) -> str:
     """Return ``url`` when it is an Echo360 watch page, otherwise an empty string."""
-    text = str(url or "").strip()
+    text = _without_secret_query(str(url or "").strip())
     return text if is_watch_page(text) else ""
 
 

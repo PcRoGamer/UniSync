@@ -41,7 +41,7 @@ _LESSON_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,300}$")
 _FILENAME_TIME = re.compile(r"T(\d{2})_(\d{2})_(\d{2})")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _WATCH_PATH = re.compile(
-    r"^/(?:lesson/.+/classroom|ui/player/[^/]+|lti/[^/]+)/?$",
+    r"^/(?:lesson/.+/classroom|ui/player/[^/]+|lti/[^/]+|media/[0-9a-fA-F-]{36}/public|public/media/[0-9a-fA-F-]{36})/?$",
     re.IGNORECASE,
 )
 _SECRET_QUERY = {
@@ -52,6 +52,7 @@ _SECRET_QUERY = {
     "token",
     "access_token",
     "signature",
+    "sessionid",
 }
 
 _json_cache: dict[str, tuple[int, int, Any]] = {}
@@ -96,10 +97,10 @@ def is_watch_page(url: object) -> bool:
     text = str(url or "").strip()
     if not is_echo360_https_url(text):
         return False
-    if _is_public_media(text):
-        return False
     parsed = urlparse(text)
     path = parsed.path or ""
+    if _is_public_media(text) and _public_media_id(text) in _PLACEMENT_IDS:
+        return False
     if ".." in path or path.lower().endswith((".m3u8", ".vtt", ".mp4")):
         return False
     if "/transcript" in path.lower() or "/media/download/" in path.lower():
@@ -178,9 +179,18 @@ def recording_fields(stem: str, *, data_root: Path, known_lesson_id: str = "") -
     return link.as_dict()
 
 
+# UniMelb's shared Canvas Echo360 placement UUID (see AGENTS.md); never a media id.
+_PLACEMENT_IDS = {"9381284d-5253-4e5b-b173-fb47a63576cb"}
+
+
 def _is_public_media(url: str) -> bool:
-    lowered = url.lower()
-    return "/media/" in lowered and "/public" in lowered
+    path = (urlparse(url).path or "").lower().rstrip("/")
+    return bool(re.fullmatch(r"/(?:media/[0-9a-f-]{36}/public|public/media/[0-9a-f-]{36})", path))
+
+
+def _public_media_id(url: str) -> str:
+    match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", (urlparse(url).path or "").lower())
+    return match.group(0) if match else ""
 
 
 def _without_secret_query(url: str) -> str:
@@ -275,11 +285,13 @@ def _media_library_link(stem: str, data_root: Path) -> RecordingLink | None:
 
 
 def _embed_watch_url(record: Mapping[str, Any]) -> str:
-    for key in ("player_url", "provider_launch_url"):
-        raw = str(record.get(key) or "").strip()
-        if _is_public_media(raw):
-            continue
-        cleaned = _clean_watch_url(raw)
+    keys = ("player_url", "provider_launch_url", "canvas_launch_url")
+    for key in keys:
+        cleaned = _clean_watch_url(record.get(key))
+        if cleaned and _is_public_media(cleaned):
+            return cleaned
+    for key in keys:
+        cleaned = _clean_watch_url(record.get(key))
         if cleaned:
             return cleaned
     media_id = str(record.get("resolved_media_id") or "").strip()

@@ -366,3 +366,30 @@ def test_lecture_tools_return_the_recording_link(data_root: Path) -> None:
     assert transcript["recording_url_source"] == "syllabus"
     assert "[00:01:02]" in transcript["transcript"]
     assert "dijkstra" in transcript["transcript"]
+
+
+def test_embed_catalog_public_media_page_is_used(data_root: Path) -> None:
+    """Live check 2026-11-11: a catalog-stored /media/<id>/public page plays on its own."""
+    media = "107b41dd-1d98-4fb8-8429-bf9801fcf040"
+    lesson = f"BLAW_EMBED_{media}"
+    _write_vtt(data_root, lesson)
+    (data_root / "libraries" / "echo360_embeds.json").write_text(json.dumps({
+        "240718": [{
+            "uuid": media,
+            "media_id": media,
+            "player_url": f"https://echo360.net.au/media/{media}",
+            "canvas_launch_url": f"https://echo360.net.au/media/{media}/public",
+        }]
+    }), encoding="utf-8")
+    echo360_links._json_cache.clear()
+
+    row = _manifest_item(data_root, lesson)
+    assert row["recording_url"] == f"https://echo360.net.au/media/{media}/public"
+    assert row["metadata"]["recording_url_source"] == "embed_catalog"
+
+
+def test_session_id_is_stripped_from_recording_links() -> None:
+    from unisync.mcp.egress import scrub_recording_url
+
+    url = "https://echo360.net.au/ui/player/8868926f-f6a1-42ac-a8d3-04848650d8a7?sessionId=abc&autoplay=false"
+    assert scrub_recording_url(url) == "https://echo360.net.au/ui/player/8868926f-f6a1-42ac-a8d3-04848650d8a7?autoplay=false"
