@@ -1671,6 +1671,7 @@ async def sync_payload(background_tasks: BackgroundTasks, body: dict[str, Any] =
                                 metadata={
                                     "asset_type": "subtitle",
                                     "lecture_date": lecture_date,
+                                    "lesson_id": lesson_id,
                                     "source_url": f"https://echo360.net.au/section/{sec_id}/home",
                                 },
                             )

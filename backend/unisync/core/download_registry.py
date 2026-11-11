@@ -43,6 +43,9 @@ class DownloadItem:
     size_bytes: int = 0
     content_type: str = "application/octet-stream"
     downloaded_at: str = ""
+    recording_url: str = ""
+    lesson_id: str = ""
+    recording_url_kind: str = ""
     metadata: dict[str, Any] = None  # type: ignore
 
     def __post_init__(self):
@@ -131,6 +134,13 @@ class DownloadRegistry:
                         size_bytes=v.get("size_bytes", 0),
                         content_type=v.get("content_type", "application/octet-stream"),
                         downloaded_at=v.get("downloaded_at", ""),
+                        recording_url=str(v.get("recording_url") or ""),
+                        lesson_id=str(v.get("lesson_id") or ""),
+                        recording_url_kind=str(
+                            v.get("recording_url_kind")
+                            or (v.get("metadata") or {}).get("recording_url_kind")
+                            or ""
+                        ),
                         metadata=v.get("metadata", {}),
                     )
                     self._index_item(item)
@@ -258,18 +268,126 @@ class DownloadRegistry:
                                 course_name=str(meta.get("course_name", "")),
                                 size_bytes=media_path.stat().st_size,
                                 content_type=str(meta.get("content_type") or "video/mp4"),
-                                metadata={"asset_type": "recording"},
+                                metadata={
+                                    "asset_type": "recording",
+                                    "lesson_id": source_id,
+                                    "source_url": str(meta.get("source_url") or ""),
+                                },
                                 auto_flush=False,
                             )
                             added += 1
                     except (OSError, TypeError, ValueError):
                         continue
 
-            if added:
+            # Existing subtitle rows gain a recording link on this same pass.
+            # Newly registered rows are included, so one flush writes both.
+            updated = self._refresh_recording_links()
+            if updated:
+                self._dirty = True
+            if added or updated:
                 self.flush()
-                logger.info("Reconciled %d local sync asset(s) into DownloadRegistry", added)
+                logger.info(
+                    "Reconciled %d local sync asset(s) into DownloadRegistry (%d recording link(s) updated)",
+                    added,
+                    updated,
+                )
         except (OSError, TypeError, ValueError):
             logger.debug("Local asset reconciliation skipped", exc_info=True)
+
+    def _is_echo360_lecture(self, item: DownloadItem) -> bool:
+        if (item.platform or "").lower() != "echo360":
+            return False
+        asset = str((item.metadata or {}).get("asset_type") or "")
+        path = item.local_filepath or ""
+        return (
+            asset in {"subtitle", "recording"}
+            or item.item_id.endswith(":subtitles")
+            or path.endswith(".vtt")
+            or (item.content_type or "").startswith("video/")
+            or (item.content_type or "").startswith("audio/")
+        )
+
+    def _lecture_stem(self, item: DownloadItem) -> str:
+        path = item.local_filepath or ""
+        if path.endswith(".vtt"):
+            return Path(path).stem
+        raw = item.item_id
+        if raw.endswith(":subtitles"):
+            raw = raw[: -len(":subtitles")]
+        return raw
+
+    def _known_lesson_id(self, item: DownloadItem) -> str:
+        """Lesson id supplied by the Echo360 payload, not one we reconstructed.
+
+        A filename or media-library id already stored on the row must not be
+        fed back in as syllabus evidence on the next flush.
+        """
+        from unisync.services.sync.echo360_links import is_api_lesson_id
+
+        meta = item.metadata or {}
+        source = str(meta.get("recording_url_source") or "")
+        if source and source != "syllabus":
+            return ""
+        for candidate in (meta.get("lesson_id"), item.lesson_id):
+            if is_api_lesson_id(candidate):
+                return str(candidate).strip()
+        raw = item.item_id
+        if raw.endswith(":subtitles"):
+            raw = raw[: -len(":subtitles")]
+        return raw if is_api_lesson_id(raw) else ""
+
+    def _apply_recording_link(self, item: DownloadItem) -> bool:
+        """Attach a watch page to one Echo360 row. Returns True when it changed."""
+        if not self._is_echo360_lecture(item):
+            return False
+        try:
+            from unisync.services.sync.echo360_links import resolve_recording_link
+
+            link = resolve_recording_link(
+                self._lecture_stem(item),
+                data_root=self._data_root(),
+                known_lesson_id=self._known_lesson_id(item),
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+        if link is None:
+            return False
+        meta = dict(item.metadata or {})
+        rank = {"syllabus": 3, "media_library": 2, "embed_catalog": 2, "filename": 1}
+        previous = str(meta.get("recording_url_source") or "")
+        if item.recording_url and rank.get(link.source, 0) < rank.get(previous, 0):
+            return False
+        if (
+            item.recording_url == link.recording_url
+            and item.lesson_id == link.lesson_id
+            and previous == link.source
+            and (item.recording_url_kind or str(meta.get("recording_url_kind") or "")) == link.kind
+        ):
+            return False
+        item.recording_url = link.recording_url
+        item.lesson_id = link.lesson_id
+        item.recording_url_kind = link.kind
+        meta["recording_url_source"] = link.source
+        meta["recording_url_kind"] = link.kind
+        meta["lesson_id"] = link.lesson_id
+        item.metadata = meta
+        return True
+
+    def _refresh_recording_links(self) -> int:
+        """Fill recording links on Echo360 rows already in memory."""
+        changed = 0
+        for item in list(self._items.values()):
+            if self._apply_recording_link(item):
+                changed += 1
+        return changed
+
+    def _data_root(self) -> Path:
+        try:
+            from unisync.core.path_service import get_path_service
+
+            return get_path_service().get_user_root()
+        except Exception:
+            return self._data_path.parent
 
     def _index_item(self, item: DownloadItem) -> None:
         key = item.key
@@ -336,6 +454,7 @@ class DownloadRegistry:
             downloaded_at=datetime.now(timezone.utc).isoformat(),
             metadata=metadata or {},
         )
+        self._apply_recording_link(item)
 
         with self._lock:
             self._index_item(item)
@@ -350,6 +469,8 @@ class DownloadRegistry:
     def flush(self) -> None:
         """Persist in-memory state to JSON atomically."""
         with self._lock:
+            if self._refresh_recording_links():
+                self._dirty = True
             if not self._dirty and self._data_path.exists():
                 return
             data = {
@@ -453,7 +574,12 @@ class DownloadRegistry:
                 sz = "-"
 
             link = it.direct_link
-            link_md = f"[Direct Link]({link})" if link.startswith("http") else f"`{link}`"
+            if link.startswith("http"):
+                link_md = f"[Direct Link]({link})"
+                if it.recording_url.startswith("https://"):
+                    link_md += f" · [Recording]({it.recording_url})"
+            else:
+                link_md = f"`{link}`"
             path = it.local_filepath.replace("\\", "/")
             fn = Path(path).name or it.title
             file_md = f"[`{fn}`](file:///{path})"
