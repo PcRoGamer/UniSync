@@ -81,6 +81,29 @@ def clean_rubric_assessment(raw_assessment: object) -> dict:
     return cleaned
 
 
+def has_meaningful_assessment(record: object) -> bool:
+    """Capture submitted work AND grade-only assessment feedback.
+
+    Canvas may give an assignment a score, rubric or marker comment without
+    providing a submitted_at timestamp (on-paper, external-tool, quizzes, etc).
+    Do not archive empty unsubmitted placeholder records.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get('submitted_at'):
+        return True
+    if record.get('submission_type') not in (None, '', 'none'):
+        return True
+    if record.get('score') is not None or record.get('grade') is not None or record.get('graded_at'):
+        return True
+    if record.get('workflow_state') == 'graded':
+        return True
+    return any(bool(record.get(key)) for key in (
+        'submission_comments', 'submission_html_comments',
+        'rubric_assessment', 'full_rubric_assessment',
+    ))
+
+
 def rubric_feedback_lines(assignment: dict, assessment: object) -> list[str]:
     if not isinstance(assessment, dict) or not assessment:
         return []
@@ -139,28 +162,31 @@ class SubmissionSync:
             url = attachment.get('url', '')
             if urlparse(url).scheme != 'https':
                 raise ValueError('Attachment requires HTTPS')
-            async with self.client.stream('GET', url, follow_redirects=True) as response:
-                response.raise_for_status()
-                if 'text/html' in response.headers.get('content-type', '').lower():
-                    raise ValueError('Received a login page instead of an attachment')
-                digest = hashlib.sha256()
-                size = 0
-                with temporary.open('wb') as output:
-                    async for block in response.aiter_bytes():
-                        size += len(block)
-                        digest.update(block)
-                        output.write(block)
-                if not size:
-                    raise ValueError('Empty attachment')
-                expected = attachment.get('size')
-                if expected is not None and size != int(expected):
-                    raise ValueError('Incomplete attachment')
-                temporary.replace(path)
+            from unisync.services.sync.gradescope import quiet_http_logs
+            with quiet_http_logs():
+                async with self.client.stream('GET', url, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    if 'text/html' in response.headers.get('content-type', '').lower():
+                        raise ValueError('Received a login page instead of an attachment')
+                    digest = hashlib.sha256()
+                    size = 0
+                    with temporary.open('wb') as output:
+                        async for block in response.aiter_bytes():
+                            size += len(block)
+                            digest.update(block)
+                            output.write(block)
+                    if not size:
+                        raise ValueError('Empty attachment')
+                    expected = attachment.get('size')
+                    if expected is not None and size != int(expected):
+                        raise ValueError('Incomplete attachment')
+                    temporary.replace(path)
             return {'status': 'downloaded', 'path': str(path), 'sha256': digest.hexdigest()}
         except Exception as exc:
             temporary.unlink(missing_ok=True)
-            # URLs may contain signed credentials; retain only the exception type.
-            return {'status': 'failed', 'error': type(exc).__name__}
+            # Signed URLs and cookies stay out of the saved error.
+            from unisync.services.sync.gradescope import safe_public_error
+            return {'status': 'failed', 'error': safe_public_error(exc)}
 
     async def archive(self, course: dict, assignment: dict, submission: dict) -> dict:
         course_name = safe_name(course.get('course_code') or course.get('name') or course['id'])
@@ -182,7 +208,9 @@ class SubmissionSync:
             if record['status'] in ('cached', 'downloaded'):
                 record['status'] = 'available'
             files.append({'id': attachment['id'], 'filename': filename, **record})
+        feedback_only = not bool(submission.get('submitted_at') or submission.get('submission_type') not in (None, '', 'none'))
         metadata = {
+            'record_kind': 'grade_or_feedback_only' if feedback_only else 'submitted',
             'course': course_name, 'course_id': course['id'],
             'assignment_id': assignment['id'], 'assignment': assignment.get('name', ''),
             'attempt': submission.get('attempt'), 'submitted_at': submission.get('submitted_at'),
@@ -200,7 +228,8 @@ class SubmissionSync:
         }
         write_changed(manifest, json.dumps(metadata, indent=2, ensure_ascii=False))
         text = BeautifulSoup(submission.get('body') or '', 'html.parser').get_text('\n', strip=True)
-        lines = [f'# Submitted work: {metadata["assignment"]}', f'Course: {course_name}',
+        heading = 'Assessment feedback (no submitted-at timestamp)' if feedback_only else 'Submitted work'
+        lines = [f'# {heading}: {metadata["assignment"]}', f'Course: {course_name}',
                  f'Canvas assignment: {metadata["canvas_url"]}', f'Attempt: {attempt}',
                  f'Submitted at: {metadata["submitted_at"]}',
                  f'Group assignment: {metadata["group_assignment"]}',
@@ -228,21 +257,51 @@ class SubmissionSync:
         if rubric_lines:
             lines.extend(['\n### Rubric assessment\n', *rubric_lines])
         write_changed(folder / f'{prefix}_submission.md', '\n'.join(lines))
-        return {'files': len(files), 'failed': sum(f['status'] == 'failed' for f in files)}
+        return {'files': len(files), 'failed': sum(f['status'] == 'failed' for f in files),
+                'feedback_only': int(feedback_only)}
 
-    async def run(self, course_id: str | None = None) -> dict:
-        counts = {'attempts': 0, 'files': 0, 'failed_files': 0, 'errors': []}
+    async def sync_gradescope(self, course: dict) -> dict | None:
+        from unisync.services.sync.gradescope import archive_gradescope
+
+        tabs = await self.pages(f'/api/v1/courses/{course["id"]}/tabs?per_page=100')
+        tab = next((
+            tab for tab in tabs
+            if str(tab.get('label') or '').strip().casefold() in {'gradescope'}
+            or str(tab.get('label') or '').strip().casefold().startswith('gradescope ')
+        ), None)
+        return await archive_gradescope(self, course, tab) if tab else None
+
+    async def run(self, course_id: str | None = None, *, include_gradescope: bool = False) -> dict:
+        counts = {'attempts': 0, 'feedback_only': 0, 'files': 0, 'failed_files': 0, 'errors': []}
         courses = await self.pages('/api/v1/courses?enrollment_type=student&enrollment_state=active&per_page=100')
         for course in courses:
             if course_id and str(course['id']) != str(course_id):
                 continue
+            if include_gradescope:
+                try:
+                    result = await self.sync_gradescope(course)
+                    counts.setdefault('gradescope', {})[str(course['id'])] = (
+                        result if result is not None else {'status': 'no_gradescope_tab'}
+                    )
+                except Exception as exc:
+                    from unisync.services.sync.gradescope import safe_public_error
+                    counts.setdefault('gradescope', {})[str(course['id'])] = {'error': safe_public_error(exc)}
             try:
                 assignments = await self.pages(
                     f'/api/v1/courses/{course["id"]}/assignments?per_page=100&include[]=submission&include[]=rubric'
                 )
+                if include_gradescope:
+                    try:
+                        from unisync.services.sync.gradescope import link_canvas_assignments
+                        link_canvas_assignments(self.root, course, assignments)
+                    except Exception as exc:
+                        from unisync.services.sync.gradescope import safe_public_error
+                        info = counts.setdefault('gradescope', {}).setdefault(str(course['id']), {})
+                        if isinstance(info, dict):
+                            info['link_error'] = safe_public_error(exc)
                 for assignment in assignments:
                     summary = assignment.get('submission') or {}
-                    if not (summary.get('submitted_at') or summary.get('submission_type')):
+                    if not has_meaningful_assessment(summary):
                         continue
                     try:
                         response = await self.client.get(
@@ -256,15 +315,16 @@ class SubmissionSync:
                             ])
                         response.raise_for_status()
                         current = response.json()
-                        attempts = {s.get('attempt'): s for s in current.get('submission_history', []) if s.get('submitted_at')}
-                        attempts[current.get('attempt')] = current
+                        attempts = {s.get('attempt') or 1: s for s in current.get('submission_history', [])
+                                    if has_meaningful_assessment(s)}
+                        if has_meaningful_assessment(current):
+                            attempts[current.get('attempt') or 1] = current
                         for submission in attempts.values():
-                            if not submission.get('submitted_at'):
-                                continue
                             result = await self.archive(course, assignment, submission)
                             counts['attempts'] += 1
                             counts['files'] += result['files']
                             counts['failed_files'] += result['failed']
+                            counts['feedback_only'] += result.get('feedback_only', 0)
                     except Exception as exc:
                         counts['errors'].append({'assignment_id': assignment['id'], 'error': type(exc).__name__})
             except Exception as exc:
@@ -287,7 +347,7 @@ async def sync_submissions(course_id: str | None = None) -> dict:
         try:
             async with httpx.AsyncClient(base_url='https://canvas.lms.unimelb.edu.au',
                                          transport=CanvasSessionTransport(), timeout=60) as client:
-                result = await SubmissionSync(client, get_path_service().get_user_root() / 'courses').run(course_id)
+                result = await SubmissionSync(client, get_path_service().get_user_root() / 'courses').run(course_id, include_gradescope=True)
             sync_status.update(state='indexing', **result)
             from unisync.services.kb import get_kb_service
             indexed = await asyncio.to_thread(get_kb_service().index_all)

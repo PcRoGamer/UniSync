@@ -2909,6 +2909,34 @@ async def _run_native_course_refresh(course_ids: list[str]) -> None:
         _schedule_broadcast()
 
 
+async def _archive_student_submissions() -> None:
+    """Archive Canvas and Gradescope submissions after a native sync tick."""
+    from unisync.services.sync.submissions import sync_submissions
+
+    try:
+        result = await sync_submissions()
+    except Exception as exc:
+        log_sync(f"Submission archive failed ({type(exc).__name__}).", 100, 100)
+        return
+    gradescope = result.get("gradescope") if isinstance(result, dict) else None
+    if not isinstance(gradescope, dict):
+        gradescope = {}
+    problems = []
+    for course_id, info in gradescope.items():
+        if not isinstance(info, dict):
+            continue
+        message = info.get("error") or (info.get("errors") or [None])[0]
+        if message:
+            problems.append(f"{course_id}: {message}")
+    detail = f"; {problems[0]}" if problems else ""
+    state = result.get("state", "done") if isinstance(result, dict) else "done"
+    log_sync(
+        f"Submission archive {state}; Gradescope courses {len(gradescope)}{detail}.",
+        100,
+        100,
+    )
+
+
 async def native_sync_scheduler() -> None:
     """Startup + periodic native sync once a verified session is available."""
     from unisync.services.sync.native_sync import NativeSyncState
@@ -2919,7 +2947,11 @@ async def native_sync_scheduler() -> None:
         try:
             state = NativeSyncState()
             if state.due() and not sync_status.get("is_syncing"):
-                await _run_sync_pipeline({}, {})
+                try:
+                    await _run_sync_pipeline({}, {})
+                except Exception as exc:
+                    logger.info("Native sync pipeline failed (%s)", type(exc).__name__)
+                await _archive_student_submissions()
         except Exception as exc:
             logger.info("Native sync scheduler unavailable (%s)", type(exc).__name__)
         await asyncio.sleep(60)
