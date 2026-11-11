@@ -778,6 +778,9 @@ def unisync_search_course_materials(
                 row["recording_url"] = item.recording_url
                 row["lesson_id"] = item.lesson_id
                 row["recording_url_source"] = str((item.metadata or {}).get("recording_url_source") or "")
+                row["recording_url_kind"] = item.recording_url_kind or str(
+                    (item.metadata or {}).get("recording_url_kind") or ""
+                )
             scored_matches.append((score, row))
 
     # 3. Direct disk crawl & exact-content grep across data/courses
@@ -1089,7 +1092,7 @@ def _lecture_recording(vtt_path: Path) -> dict[str, str]:
     except Exception:
         data_root = vtt_path.parent.parent.parent
     fields = recording_fields(vtt_path.stem, data_root=data_root)
-    fields["recording_url"] = scrub_recording_url(fields.get("recording_url"))
+    fields["recording_url"] = scrub_recording_url(fields.get("recording_url"), allow_canvas=True)
     return fields
 
 
@@ -1177,6 +1180,7 @@ def unisync_search_lectures(
                 "lesson_id": recording["lesson_id"],
                 "recording_url": recording["recording_url"],
                 "recording_url_source": recording["recording_url_source"],
+                "recording_url_kind": recording.get("recording_url_kind", ""),
                 "hit_count": len(matched_cues),
                 "cues": matched_cues,
             })
@@ -1254,6 +1258,7 @@ def unisync_get_lecture_transcript(
             "lesson_id": recording["lesson_id"],
             "recording_url": recording["recording_url"],
             "recording_url_source": recording["recording_url_source"],
+            "recording_url_kind": recording.get("recording_url_kind", ""),
             "truncated": truncated,
             "transcript": joined[:max_chars],
         }), indent=2)

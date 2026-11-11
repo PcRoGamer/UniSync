@@ -12,10 +12,11 @@ Preference order:
    catalog already emits: ``https://echo360.net.au/lesson/<id>/classroom?focus=Video``.
 2. ``media_library`` — ``source_url`` already stored on
    ``data/media_library/<id>/metadata.json`` when it is an Echo360 watch page.
-3. ``embed_catalog`` — ``player_url`` (or ``provider_launch_url``) the sync
-   resolved onto ``data/libraries/echo360_embeds.json``. ``/media/<id>/public``
-   is skipped; that path 404s. A ``resolved_media_id`` becomes
-   ``/ui/player/<id>``, which is the player the native ingestor opens.
+3. ``embed_catalog`` — a stored public page
+   (``/media/<id>/public`` or ``/public/media/<id>``) from the embed catalog.
+   ``/lti/`` and ``/ui/player/`` are not directly watchable. When no public
+   page is recorded, the Canvas page, module item, or Lecture Capture tool
+   URL already on the catalog is used instead. Nothing is invented.
 4. ``filename`` — last resort for ``G_`` subtitle stems. Cache files replace
    ``:`` with ``_`` because Windows filenames cannot contain colons. Restoring
    those colons rebuilds the lesson id. Embed filenames are never turned into
@@ -34,26 +35,42 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 _HOST = "echo360.net.au"
+_CANVAS_HOST = "canvas.lms.unimelb.edu.au"
 _LESSON_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,300}$")
 _FILENAME_TIME = re.compile(r"T(\d{2})_(\d{2})_(\d{2})")
-_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _WATCH_PATH = re.compile(
-    r"^/(?:lesson/.+/classroom|ui/player/[^/]+|lti/[^/]+|media/[0-9a-fA-F-]{36}/public|public/media/[0-9a-fA-F-]{36})/?$",
+    r"^/(?:lesson/.+/classroom|media/[0-9a-fA-F-]{36}/public|public/media/[0-9a-fA-F-]{36})/?$",
     re.IGNORECASE,
 )
-_SECRET_QUERY = {
-    "cloudfront-signature",
-    "cloudfront-policy",
-    "cloudfront-key-pair-id",
-    "echo_jwt",
-    "token",
-    "access_token",
-    "signature",
-    "sessionid",
+_UNPLAYABLE_PATH = re.compile(r"^/(?:ui/player/[^/]+|lti/[^/]+)/?$", re.IGNORECASE)
+_CANVAS_PATH = re.compile(
+    r"^/courses/\d+/(?:pages(?:/[^/]+)?|modules(?:/items/\d+)?|external_tools/(?:\d+|retrieve))/?$",
+    re.IGNORECASE,
+)
+# Query keys that identify a page without granting access. Everything else,
+# including sessionId and secureLinkAccessDataId, is dropped.
+_ALLOWED_QUERY = {
+    "focus",
+    "linkid",
+    "autoplay",
+    "automute",
+    "display",
+    "currentmediaid",
+    "url",
 }
+_ECHO_URL_FIELDS = ("player_url", "provider_launch_url", "canvas_launch_url")
+_CANVAS_URL_FIELDS = (
+    "canvas_launch_url",
+    "canvas_page_url",
+    "page_url",
+    "html_url",
+    "source_page_url",
+    "module_item_url",
+    "module_url",
+)
 
 _json_cache: dict[str, tuple[int, int, Any]] = {}
 
@@ -65,12 +82,14 @@ class RecordingLink:
     lesson_id: str
     recording_url: str
     source: str
+    kind: str = ""
 
     def as_dict(self) -> dict[str, str]:
         return {
             "lesson_id": self.lesson_id,
             "recording_url": self.recording_url,
             "recording_url_source": self.source,
+            "recording_url_kind": self.kind,
         }
 
 
@@ -90,9 +109,10 @@ def is_echo360_https_url(url: object) -> bool:
 
 
 def is_watch_page(url: object) -> bool:
-    """True when ``url`` is an Echo360 lesson, player, or LTI page over https.
+    """True for an Echo360 lesson classroom or public media page over https.
 
-    Signed media playlists and ``/media/<id>/public`` are not watch pages.
+    ``/lti/`` and ``/ui/player/`` are not directly watchable. The shared Canvas
+    placement UUID is not a media id. Signed playlists are not watch pages.
     """
     text = str(url or "").strip()
     if not is_echo360_https_url(text):
@@ -106,6 +126,40 @@ def is_watch_page(url: object) -> bool:
     if "/transcript" in path.lower() or "/media/download/" in path.lower():
         return False
     return bool(_WATCH_PATH.match(path))
+
+
+def is_canvas_recording_url(url: object) -> bool:
+    """True for a Canvas page, module item, or Lecture Capture tool URL.
+
+    Only ``canvas.lms.unimelb.edu.au``. This is the host egress may keep on
+    ``recording_url`` and nowhere else.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or host != _CANVAS_HOST or parsed.username or parsed.password:
+        return False
+    path = parsed.path or ""
+    return ".." not in path and bool(_CANVAS_PATH.match(path))
+
+
+def recording_kind(url: str) -> str:
+    """``echo360_lesson``, ``echo360_public``, or ``canvas_embed_page``."""
+    if is_canvas_recording_url(url):
+        return "canvas_embed_page"
+    if not is_watch_page(url):
+        return ""
+    path = (urlparse(url).path or "").lower()
+    if "/lesson/" in path and path.rstrip("/").endswith("/classroom"):
+        return "echo360_lesson"
+    if _is_public_media(url):
+        return "echo360_public"
+    return ""
 
 
 def is_api_lesson_id(value: object) -> bool:
@@ -148,12 +202,12 @@ def resolve_recording_link(
     if syllabus_id:
         url = classroom_url(syllabus_id)
         if url:
-            return RecordingLink(syllabus_id, url, "syllabus")
+            return RecordingLink(syllabus_id, url, "syllabus", "echo360_lesson")
 
     if is_api_lesson_id(known_lesson_id):
         url = classroom_url(known_lesson_id)
         if url:
-            return RecordingLink(known_lesson_id.strip(), url, "syllabus")
+            return RecordingLink(known_lesson_id.strip(), url, "syllabus", "echo360_lesson")
 
     media = _media_library_link(text, root) if text else None
     if media is not None:
@@ -167,7 +221,7 @@ def resolve_recording_link(
     if restored:
         url = classroom_url(restored)
         if url:
-            return RecordingLink(restored, url, "filename")
+            return RecordingLink(restored, url, "filename", "echo360_lesson")
     return None
 
 
@@ -175,7 +229,12 @@ def recording_fields(stem: str, *, data_root: Path, known_lesson_id: str = "") -
     """JSON fields for a lecture result. Missing links are empty strings."""
     link = resolve_recording_link(stem, data_root=data_root, known_lesson_id=known_lesson_id)
     if link is None:
-        return {"lesson_id": "", "recording_url": "", "recording_url_source": ""}
+        return {
+            "lesson_id": "",
+            "recording_url": "",
+            "recording_url_source": "",
+            "recording_url_kind": "",
+        }
     return link.as_dict()
 
 
@@ -193,21 +252,39 @@ def _public_media_id(url: str) -> str:
     return match.group(0) if match else ""
 
 
-def _without_secret_query(url: str) -> str:
+def _without_secret_query(url: str, *, _depth: int = 0) -> str:
+    """Keep only harmless query keys. Nested ``url`` values are cleaned too."""
     parsed = urlparse(url)
-    if not parsed.query:
+    if not parsed.query or _depth > 2:
         return url
-    kept = [
-        (key, value)
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.lower() not in _SECRET_QUERY
-    ]
+    kept: list[tuple[str, str]] = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.lower() not in _ALLOWED_QUERY:
+            continue
+        if key.lower() == "url" and _depth < 2:
+            nested = unquote(value).strip()
+            if nested.startswith(("https://", "http://")):
+                value = _without_secret_query(nested, _depth=_depth + 1)
+        kept.append((key, value))
     return urlunparse(parsed._replace(query=urlencode(kept)))
 
 
 def _clean_watch_url(url: object) -> str:
     text = _without_secret_query(str(url or "").strip())
     return text if is_watch_page(text) else ""
+
+
+def _clean_canvas_url(url: object) -> str:
+    text = _without_secret_query(str(url or "").strip())
+    return text if is_canvas_recording_url(text) else ""
+
+
+def _is_unplayable_echo(url: object) -> bool:
+    text = str(url or "").strip()
+    if not is_echo360_https_url(text):
+        return False
+    path = urlparse(text).path or ""
+    return bool(_UNPLAYABLE_PATH.match(path))
 
 
 def _read_json(path: Path) -> Any:
@@ -277,27 +354,60 @@ def _media_library_link(stem: str, data_root: Path) -> RecordingLink | None:
             continue
         stored = _clean_watch_url(meta.get("source_url"))
         if stored:
-            return RecordingLink(source_id, stored, "media_library")
-        built = classroom_url(source_id)
-        if built:
-            return RecordingLink(source_id, built, "media_library")
+            return RecordingLink(source_id, stored, "media_library", recording_kind(stored))
+        if source_id.startswith("G_") or is_api_lesson_id(source_id):
+            built = classroom_url(source_id)
+            if built:
+                return RecordingLink(source_id, built, "media_library", "echo360_lesson")
     return None
 
 
-def _embed_watch_url(record: Mapping[str, Any]) -> str:
-    keys = ("player_url", "provider_launch_url", "canvas_launch_url")
-    for key in keys:
-        cleaned = _clean_watch_url(record.get(key))
-        if cleaned and _is_public_media(cleaned):
-            return cleaned
-    for key in keys:
-        cleaned = _clean_watch_url(record.get(key))
-        if cleaned:
-            return cleaned
-    media_id = str(record.get("resolved_media_id") or "").strip()
-    if _UUID.fullmatch(media_id):
-        return _clean_watch_url(f"https://echo360.net.au/ui/player/{media_id}")
+def _course_lecture_capture(data_root: Path, course_id: object) -> str:
+    """Lecture Capture URL already stored for this Canvas course, if any."""
+    loaded = _read_json(data_root / "libraries" / "libraries.json")
+    if not isinstance(loaded, Mapping):
+        return ""
+    wanted = str(course_id or "")
+    for lib in loaded.values():
+        if not isinstance(lib, Mapping):
+            continue
+        if str(lib.get("canvas_course_id") or "") != wanted:
+            continue
+        return _clean_canvas_url(lib.get("lecture_capture_url"))
     return ""
+
+
+def _embed_choice(record: Mapping[str, Any], *, canvas_fallback: str = "") -> tuple[str, str] | None:
+    """Best link that actually opens, plus its kind. Never synthesizes a URL."""
+    public = ""
+    lesson = ""
+    canvas = ""
+    saw_unplayable = False
+    for key in _ECHO_URL_FIELDS:
+        raw = record.get(key)
+        cleaned = _clean_watch_url(raw)
+        kind = recording_kind(cleaned) if cleaned else ""
+        if kind == "echo360_public" and not public:
+            public = cleaned
+        elif kind == "echo360_lesson" and not lesson:
+            lesson = cleaned
+        elif _is_unplayable_echo(raw):
+            saw_unplayable = True
+    for key in _CANVAS_URL_FIELDS:
+        cleaned = _clean_canvas_url(record.get(key))
+        if cleaned and not canvas:
+            canvas = cleaned
+    if not canvas:
+        canvas = canvas_fallback
+    if public:
+        return public, "echo360_public"
+    if lesson:
+        return lesson, "echo360_lesson"
+    if canvas:
+        return canvas, "canvas_embed_page"
+    if saw_unplayable:
+        return "", "unplayable_lti"
+    return None
 
 
 def _embed_link(stem: str, data_root: Path) -> RecordingLink | None:
@@ -308,9 +418,10 @@ def _embed_link(stem: str, data_root: Path) -> RecordingLink | None:
     loaded = _read_json(data_root / "libraries" / "echo360_embeds.json")
     if not isinstance(loaded, Mapping):
         return None
-    for items in loaded.values():
+    for course_id, items in loaded.items():
         if not isinstance(items, list):
             continue
+        canvas_fallback = _course_lecture_capture(data_root, course_id)
         for record in items:
             if not isinstance(record, Mapping):
                 continue
@@ -318,9 +429,10 @@ def _embed_link(stem: str, data_root: Path) -> RecordingLink | None:
             names.update(embed_transcript_lesson_ids(record))
             if stem not in names:
                 continue
-            url = _embed_watch_url(record)
-            if not url:
+            choice = _embed_choice(record, canvas_fallback=canvas_fallback)
+            if choice is None:
                 continue
+            url, kind = choice
             lesson_id = next(iter(embed_transcript_lesson_ids(record)), stem)
-            return RecordingLink(safe_name(lesson_id), url, "embed_catalog")
+            return RecordingLink(safe_name(lesson_id), url, "embed_catalog", kind)
     return None

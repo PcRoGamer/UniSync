@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import pytest
 
@@ -268,10 +268,11 @@ def test_embed_stores_the_resolved_player_url(data_root: Path) -> None:
     echo360_links._json_cache.clear()
 
     row = _manifest_item(data_root, lesson)
-    assert row["recording_url"] == player
+    assert row["recording_url"] == ""
+    assert row["recording_url_kind"] == "unplayable_lti"
     assert row["lesson_id"] == lesson
     assert row["metadata"]["recording_url_source"] == "embed_catalog"
-    assert "/media/" not in row["recording_url"]
+    assert "lti" not in row["recording_url"]
 
 
 def test_embed_public_media_url_is_not_used(data_root: Path) -> None:
@@ -291,7 +292,8 @@ def test_embed_public_media_url_is_not_used(data_root: Path) -> None:
     assert "recording_url_source" not in row.get("metadata", {})
 
 
-def test_embed_uses_resolved_media_player_when_launch_url_is_public(data_root: Path) -> None:
+def test_resolved_player_id_is_not_a_standalone_link(data_root: Path) -> None:
+    """``/ui/player/<id>`` returns 403 outside the Echo360 session. Do not store it."""
     lesson = embed_lesson_id(TOOL_UUID, LINK_ID)
     _write_vtt(data_root, lesson)
     (data_root / "libraries" / "echo360_embeds.json").write_text(json.dumps({
@@ -305,8 +307,9 @@ def test_embed_uses_resolved_media_player_when_launch_url_is_public(data_root: P
     echo360_links._json_cache.clear()
 
     row = _manifest_item(data_root, lesson)
-    assert row["recording_url"] == f"https://echo360.net.au/ui/player/{MEDIA_ID}"
-    assert row["metadata"]["recording_url_source"] == "embed_catalog"
+    assert row.get("recording_url", "") == ""
+    assert "ui/player" not in json.dumps(row)
+    assert "external_tools/701" not in json.dumps(row)
 
 
 def test_shared_tool_uuid_file_does_not_take_another_links_player(data_root: Path) -> None:
@@ -356,6 +359,7 @@ def test_lecture_tools_return_the_recording_link(data_root: Path) -> None:
     lesson_id = lesson_id_from_filename(COMP_STEM)
     assert hit["recording_url"] == classroom_url(lesson_id)
     assert hit["recording_url_source"] == "syllabus"
+    assert hit["recording_url_kind"] == "echo360_lesson"
     assert hit["lesson_id"] == lesson_id
     assert hit["cues"][0]["timestamp"] == "00:01:02"
     assert hit["cues"][0]["recording_url"] == hit["recording_url"]
@@ -364,6 +368,7 @@ def test_lecture_tools_return_the_recording_link(data_root: Path) -> None:
     transcript = json.loads(unisync_get_lecture_transcript(COMP_STEM, max_chars=2000))
     assert transcript["recording_url"] == hit["recording_url"]
     assert transcript["recording_url_source"] == "syllabus"
+    assert transcript["recording_url_kind"] == "echo360_lesson"
     assert "[00:01:02]" in transcript["transcript"]
     assert "dijkstra" in transcript["transcript"]
 
@@ -385,11 +390,116 @@ def test_embed_catalog_public_media_page_is_used(data_root: Path) -> None:
 
     row = _manifest_item(data_root, lesson)
     assert row["recording_url"] == f"https://echo360.net.au/media/{media}/public"
+    assert row["recording_url_kind"] == "echo360_public"
     assert row["metadata"]["recording_url_source"] == "embed_catalog"
 
 
-def test_session_id_is_stripped_from_recording_links() -> None:
+def test_access_query_params_are_stripped_and_player_urls_are_not_watchable() -> None:
     from unisync.mcp.egress import scrub_recording_url
 
-    url = "https://echo360.net.au/ui/player/8868926f-f6a1-42ac-a8d3-04848650d8a7?sessionId=abc&autoplay=false"
-    assert scrub_recording_url(url) == "https://echo360.net.au/ui/player/8868926f-f6a1-42ac-a8d3-04848650d8a7?autoplay=false"
+    media = "107b41dd-1d98-4fb8-8429-bf9801fcf040"
+    public = (
+        f"https://echo360.net.au/media/{media}/public"
+        "?autoplay=false&sessionId=abc&secureLinkAccessDataId=grant&tracking=1"
+    )
+    assert scrub_recording_url(public) == f"https://echo360.net.au/media/{media}/public?autoplay=false"
+    player = "https://echo360.net.au/ui/player/8868926f-f6a1-42ac-a8d3-04848650d8a7?sessionId=abc&autoplay=false"
+    assert scrub_recording_url(player) == ""
+    lti = f"https://echo360.net.au/lti/{TOOL_UUID}?linkId={LINK_ID}&secureLinkAccessDataId=grant&sessionId=abc"
+    assert scrub_recording_url(lti) == ""
+
+    canvas = "https://canvas.lms.unimelb.edu.au/courses/240718/pages/week-3"
+    payload = scrub_lecture_payload({
+        "recording_url": canvas,
+        "player_url": canvas,
+        "classroom_url": canvas,
+    })
+    assert payload["recording_url"] == canvas
+    assert payload["player_url"] == ""
+    assert payload["classroom_url"] == ""
+
+
+def test_public_page_is_preferred_over_lti_and_canvas(data_root: Path) -> None:
+    media = "107b41dd-1d98-4fb8-8429-bf9801fcf040"
+    lesson = embed_lesson_id(media, LINK_ID)
+    _write_vtt(data_root, lesson)
+    (data_root / "libraries" / "echo360_embeds.json").write_text(json.dumps({
+        "240718": [{
+            "uuid": media,
+            "link_id": LINK_ID,
+            "player_url": f"https://echo360.net.au/lti/{media}?linkId={LINK_ID}&sessionId=sess&secureLinkAccessDataId=grant",
+            "canvas_launch_url": f"https://echo360.net.au/public/media/{media}?autoplay=false&sessionId=sess",
+            "canvas_page_url": "https://canvas.lms.unimelb.edu.au/courses/240718/pages/week-3",
+        }]
+    }), encoding="utf-8")
+    echo360_links._json_cache.clear()
+
+    row = _manifest_item(data_root, lesson)
+    assert row["recording_url"] == f"https://echo360.net.au/public/media/{media}?autoplay=false"
+    assert row["recording_url_kind"] == "echo360_public"
+    assert "sessionId" not in row["recording_url"]
+    assert "secureLinkAccessDataId" not in row["recording_url"]
+
+
+def test_canvas_page_is_used_when_no_public_page_exists(data_root: Path) -> None:
+    lesson = embed_lesson_id(MEDIA_ID, LINK_ID)
+    nested = (
+        f"https://echo360.net.au/lti/{MEDIA_ID}?linkId={LINK_ID}"
+        "&sessionId=sess&secureLinkAccessDataId=grant"
+    )
+    canvas = (
+        "https://canvas.lms.unimelb.edu.au/courses/240718/external_tools/retrieve"
+        f"?display=borderless&url={quote(nested, safe='')}"
+    )
+    _write_vtt(data_root, lesson)
+    (data_root / "libraries" / "echo360_embeds.json").write_text(json.dumps({
+        "240718": [{
+            "uuid": MEDIA_ID,
+            "link_id": LINK_ID,
+            "player_url": f"https://echo360.net.au/lti/{MEDIA_ID}?linkId={LINK_ID}",
+            "canvas_launch_url": canvas,
+            "resolved_media_id": MEDIA_ID,
+        }]
+    }), encoding="utf-8")
+    echo360_links._json_cache.clear()
+
+    row = _manifest_item(data_root, lesson)
+    assert row["recording_url_kind"] == "canvas_embed_page"
+    assert row["recording_url"].startswith(
+        "https://canvas.lms.unimelb.edu.au/courses/240718/external_tools/retrieve?"
+    )
+    assert "secureLinkAccessDataId" not in row["recording_url"]
+    assert "sessionId" not in unquote(row["recording_url"])
+    assert "linkId" in unquote(row["recording_url"])
+    assert "ui/player" not in row["recording_url"]
+
+
+def test_lecture_capture_url_is_used_only_when_the_catalog_records_it(data_root: Path) -> None:
+    lesson = embed_lesson_id(MEDIA_ID, LINK_ID)
+    capture = "https://canvas.lms.unimelb.edu.au/courses/240718/external_tools/701"
+    _write_vtt(data_root, lesson)
+    (data_root / "libraries" / "echo360_embeds.json").write_text(json.dumps({
+        "240718": [{
+            "uuid": MEDIA_ID,
+            "link_id": LINK_ID,
+            "player_url": f"https://echo360.net.au/ui/player/{MEDIA_ID}?sessionId=sess",
+        }]
+    }), encoding="utf-8")
+    echo360_links._json_cache.clear()
+
+    missing = _manifest_item(data_root, lesson)
+    assert missing["recording_url"] == ""
+    assert missing["recording_url_kind"] == "unplayable_lti"
+    assert "701" not in missing["recording_url"]
+
+    (data_root / "libraries" / "libraries.json").write_text(json.dumps({
+        "blaw": {
+            "canvas_course_id": "240718",
+            "lecture_capture_url": capture,
+        }
+    }), encoding="utf-8")
+    echo360_links._json_cache.clear()
+    (data_root / "downloads_manifest.json").unlink()
+    recorded = _manifest_item(data_root, lesson)
+    assert recorded["recording_url"] == capture
+    assert recorded["recording_url_kind"] == "canvas_embed_page"

@@ -45,6 +45,7 @@ class DownloadItem:
     downloaded_at: str = ""
     recording_url: str = ""
     lesson_id: str = ""
+    recording_url_kind: str = ""
     metadata: dict[str, Any] = None  # type: ignore
 
     def __post_init__(self):
@@ -135,6 +136,11 @@ class DownloadRegistry:
                         downloaded_at=v.get("downloaded_at", ""),
                         recording_url=str(v.get("recording_url") or ""),
                         lesson_id=str(v.get("lesson_id") or ""),
+                        recording_url_kind=str(
+                            v.get("recording_url_kind")
+                            or (v.get("metadata") or {}).get("recording_url_kind")
+                            or ""
+                        ),
                         metadata=v.get("metadata", {}),
                     )
                     self._index_item(item)
@@ -355,11 +361,14 @@ class DownloadRegistry:
             item.recording_url == link.recording_url
             and item.lesson_id == link.lesson_id
             and previous == link.source
+            and (item.recording_url_kind or str(meta.get("recording_url_kind") or "")) == link.kind
         ):
             return False
         item.recording_url = link.recording_url
         item.lesson_id = link.lesson_id
+        item.recording_url_kind = link.kind
         meta["recording_url_source"] = link.source
+        meta["recording_url_kind"] = link.kind
         meta["lesson_id"] = link.lesson_id
         item.metadata = meta
         return True
