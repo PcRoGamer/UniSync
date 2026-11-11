@@ -762,7 +762,7 @@ def unisync_search_course_materials(
 
         if score >= 30:
             seen_paths.add(str(Path(local_p).resolve()) if local_p else filename)
-            scored_matches.append((score, {
+            row = {
                 "filename": filename,
                 "title": item.title,
                 "course": c_name or "University Subject",
@@ -772,7 +772,13 @@ def unisync_search_course_materials(
                 "file_type": file_ext or item.content_type,
                 "match_type": "filename_or_metadata",
                 "downloaded_at": item.downloaded_at,
-            }))
+            }
+            if (item.platform or "").lower() == "echo360":
+                row["direct_link"] = item.direct_link
+                row["recording_url"] = item.recording_url
+                row["lesson_id"] = item.lesson_id
+                row["recording_url_source"] = str((item.metadata or {}).get("recording_url_source") or "")
+            scored_matches.append((score, row))
 
     # 3. Direct disk crawl & exact-content grep across data/courses
     courses_dir = user_root / "courses"
@@ -903,11 +909,13 @@ def unisync_search_course_materials(
             seen_final.add(k)
             deduped.append(item)
 
-    return json.dumps({
+    from unisync.mcp.egress import scrub_lecture_payload
+
+    return json.dumps(scrub_lecture_payload({
         "query": query,
         "total_found": len(deduped),
         "files": deduped[:limit],
-    }, indent=2)
+    }), indent=2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1070,6 +1078,21 @@ def unisync_read_course_file(file_path: str, max_chars: int = 8000) -> str:
 # Tool 5: Search Lecture Transcripts
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _lecture_recording(vtt_path: Path) -> dict[str, str]:
+    """Watch page for one cached subtitle, after the egress allowlist."""
+    from unisync.mcp.egress import scrub_recording_url
+    from unisync.services.sync.echo360_links import recording_fields
+
+    try:
+        from unisync.core.path_service import get_path_service
+        data_root = get_path_service().get_user_root()
+    except Exception:
+        data_root = vtt_path.parent.parent.parent
+    fields = recording_fields(vtt_path.stem, data_root=data_root)
+    fields["recording_url"] = scrub_recording_url(fields.get("recording_url"))
+    return fields
+
+
 @mcp.tool()
 def unisync_search_lectures(
     query: str,
@@ -1084,7 +1107,7 @@ def unisync_search_lectures(
         limit: Maximum number of matching lectures to return (default 5).
 
     Returns:
-        Matching lecture recordings with lecture date, course, and exact timestamp cues [mm:ss].
+        Matching lecture recordings with lecture date, Echo360 watch URL, and timestamp cues.
     """
     try:
         from unisync.core.path_service import get_path_service
@@ -1143,9 +1166,17 @@ def unisync_search_lectures(
                     break
 
         if matched_cues:
+            recording = _lecture_recording(f)
+            for cue in matched_cues:
+                # Echo360 classroom URLs have no start-time parameter.
+                # The cue timestamp stays beside the recording link.
+                cue["recording_url"] = recording["recording_url"]
             matches.append({
                 "lecture_date": lec_date,
                 "file_id": f.stem,
+                "lesson_id": recording["lesson_id"],
+                "recording_url": recording["recording_url"],
+                "recording_url_source": recording["recording_url_source"],
                 "hit_count": len(matched_cues),
                 "cues": matched_cues,
             })
@@ -1153,11 +1184,13 @@ def unisync_search_lectures(
     # Sort most recent lectures first, pushing lectures with unknown dates to the end
     matches.sort(key=lambda x: x["lecture_date"] if x["lecture_date"] != "Unknown Date" else "", reverse=True)
 
-    return json.dumps({
+    from unisync.mcp.egress import scrub_lecture_payload
+
+    return json.dumps(scrub_lecture_payload({
         "query": query,
         "total_lectures_matched": len(matches),
         "results": matches[:limit],
-    }, indent=2)
+    }), indent=2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1176,7 +1209,7 @@ def unisync_get_lecture_transcript(
         max_chars: Maximum characters to return (default 12000).
 
     Returns:
-        Structured transcript text grouped into timestamped paragraphs.
+        Structured transcript text grouped into timestamped paragraphs, plus the Echo360 watch URL.
     """
     try:
         from unisync.core.path_service import get_path_service
@@ -1190,10 +1223,9 @@ def unisync_get_lecture_transcript(
     target = lecture_date_or_id.strip()
     candidates = [f for f in vtt_dir.glob("*.vtt") if target in f.name]
     candidates.sort(key=lambda x: x.stat().st_size, reverse=True)
-    if candidates:
-        matched_file = candidates[0]
+    matched_file = candidates[0] if candidates else None
 
-    if not matched_file:
+    if matched_file is None:
         return json.dumps({
             "error": f"No transcript found for '{lecture_date_or_id}'.",
             "suggestion": "Call unisync_search_lectures to discover matching lecture dates.",
@@ -1214,11 +1246,17 @@ def unisync_get_lecture_transcript(
 
         joined = filter_academic_boilerplate("\n".join(lines))
         truncated = len(joined) > max_chars
-        return json.dumps({
+        recording = _lecture_recording(matched_file)
+        from unisync.mcp.egress import scrub_lecture_payload
+
+        return json.dumps(scrub_lecture_payload({
             "file": matched_file.name,
+            "lesson_id": recording["lesson_id"],
+            "recording_url": recording["recording_url"],
+            "recording_url_source": recording["recording_url_source"],
             "truncated": truncated,
             "transcript": joined[:max_chars],
-        }, indent=2)
+        }), indent=2)
     except Exception as exc:
         return json.dumps({"error": f"Failed reading transcript: {exc}"})
 
@@ -1662,14 +1700,18 @@ def unisync_search(
             kb = get_kb_service()
             kb_results = kb.search(query=query, course=course, limit=limit)
         for kr in kb_results:
-            matched_passages.append({
-                "file": kr.get("file_name") or Path(kr.get("file_path", "")).name,
+            file_path = str(kr.get("file_path") or "")
+            passage = {
+                "file": kr.get("file_name") or Path(file_path).name,
                 "course": kr.get("course"),
                 "section": kr.get("section_title"),
                 "timestamp": f"[{kr.get('timestamp_start')} - {kr.get('timestamp_end')}]" if kr.get("timestamp_start") else None,
                 "score": kr.get("score"),
                 "excerpt": (kr.get("text") or "")[:350].strip(),
-            })
+            }
+            if file_path.endswith(".vtt"):
+                passage.update(_lecture_recording(Path(file_path)))
+            matched_passages.append(passage)
     except Exception as _e:
         logger.debug("unisync_search kb lookup error: %s", _e)
 
@@ -1681,7 +1723,9 @@ def unisync_search(
         + len(matched_passages)
     )
 
-    return json.dumps({
+    from unisync.mcp.egress import scrub_lecture_payload
+
+    return json.dumps(scrub_lecture_payload({
         "query": query,
         "course_filter": course,
         "total_results": total_hits,
@@ -1692,7 +1736,7 @@ def unisync_search(
             "announcements": matched_announcements,
             "semantic_passages": matched_passages,
         },
-    }, indent=2)
+    }), indent=2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
