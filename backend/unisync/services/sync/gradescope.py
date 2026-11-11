@@ -26,8 +26,16 @@ LAUNCH_HOSTS = {
     CANVAS,
     "sso.canvaslms.com",
     "canvas.instructure.com",
+    # Gradescope (Turnitin) LTI 1.3 OIDC login and launch host.
+    "lti-gradescope.int.turnitin.com",
+    # Turnitin platform OIDC proxy Gradescope posts its login request to.
+    "lti.int.turnitin.com",
 }
 GRADESCOPE = {"www.gradescope.com", "gradescope.com"}
+TURNITIN_LTI = "lti-gradescope.int.turnitin.com"
+# Gradescope serves a JSON stub for submission URLs unless HTML is requested.
+HTML_ACCEPT = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+_SCRIPT_REDIRECT = re.compile(r"""\bredirect_url\s*=\s*new URL\(\s*"((?:[^"\\]|\\.)*)"\s*\)""")
 HOSTS = GRADESCOPE | LAUNCH_HOSTS
 
 SUBMISSION = re.compile(r"/courses/(\d+)/assignments/(\d+)/submissions/(\d+)")
@@ -79,7 +87,12 @@ def titles_match(left: object, right: object) -> bool:
     if a == b:
         return True
     shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    return len(shorter) >= 8 and shorter in longer
+    if len(shorter) >= 8 and shorter in longer:
+        return True
+    # Spacing differs between Canvas and Gradescope ("MST 2026S2" vs
+    # "MST2026S2-VerA"): compare alphanumerics and allow a version suffix.
+    short, full = sorted((a.replace(" ", ""), b.replace(" ", "")), key=len)
+    return len(short) >= 6 and any(ch.isdigit() for ch in short) and full.startswith(short)
 
 
 def _remember(counts: dict, message: str) -> None:
@@ -246,7 +259,73 @@ def _question_from_props(question: dict) -> dict:
     }
 
 
+def _text_of(entry: object) -> str:
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict):
+        for key in ("comments", "comment", "text", "content", "body"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _from_viewer(props: dict) -> dict:
+    """Gradescope's live AssignmentSubmissionViewer: scores and rubric are keyed by question id."""
+    submission = props.get("assignment_submission") or {}
+    assignment = props.get("assignment") if isinstance(props.get("assignment"), dict) else {}
+    questions = {str(q.get("id")): q for q in props.get("questions") or [] if isinstance(q, dict)}
+    answers = {str(q.get("question_id")): q for q in props.get("question_submissions") or [] if isinstance(q, dict)}
+    groups = {str(g.get("id")): g for g in props.get("rubric_item_groups") or [] if isinstance(g, dict)}
+    order = [str(i) for i in props.get("inorder_leaf_question_ids") or []]
+    order += [k for k, q in questions.items() if k not in order and q.get("type") != "QuestionGroup"]
+    leaves = []
+    for qid in order:
+        question = questions.get(qid) or {}
+        answer = answers.get(qid) or {}
+        items, comments = [], []
+        for item in props.get("rubric_items") or []:
+            if not isinstance(item, dict) or str(item.get("question_id")) != qid or not item.get("present"):
+                continue
+            record = {"description": str(item.get("description") or "").strip(),
+                      "points": _number(item.get("weight")), "applied": True}
+            group = groups.get(str(item.get("group_id")))
+            if group and str(group.get("description") or "").strip():
+                record["group"] = str(group["description"]).strip()
+            items.append(record)
+        for entry in list(answer.get("evaluations") or []) + list(answer.get("annotations") or []):
+            text = _text_of(entry)
+            if text and text not in comments:
+                comments.append(text)
+        number = str(question.get("full_index") or question.get("index") or qid)
+        title = str(question.get("numbered_title") or question.get("title") or "").strip()
+        leaves.append({
+            "id": number,
+            "title": title or f"Question {number}",
+            "score": _number(answer.get("score")),
+            "points_possible": _number(question.get("weight")),
+            "rubric_items": items,
+            "comments": comments,
+        })
+    current = props.get("current_user") if isinstance(props.get("current_user"), dict) else {}
+    owners = [o.get("user_id") for o in props.get("ownerships") or [] if isinstance(o, dict) and o.get("active", True)]
+    owner = current.get("id") if current.get("id") in owners else (owners[0] if owners else submission.get("uploaded_by_user_id"))
+    return {
+        "assignment": str(assignment.get("title") or ""),
+        "score": _number(submission.get("score")),
+        "points_possible": _number(assignment.get("total_points")),
+        "questions": leaves,
+        "comments": [],
+        "updated_at": submission.get("updated_at") or submission.get("created_at"),
+        "owner_id": owner,
+        "current_user_id": current.get("id"),
+        "submission_id": None if submission.get("id") is None else str(submission.get("id")),
+    }
+
+
 def _from_props(props: dict) -> dict | None:
+    if isinstance(props.get("assignment_submission"), dict):
+        return _from_viewer(props)
     submission = props.get("submission") if isinstance(props.get("submission"), dict) else {}
     assignment = props.get("assignment") if isinstance(props.get("assignment"), dict) else {}
     questions_raw = props.get("questions")
@@ -508,6 +587,19 @@ def link_canvas_assignments(root: Path, course: dict, assignments: list[dict]) -
     return updated
 
 
+def _script_redirect(text: str, base: str) -> str | None:
+    """Return the trusted Gradescope URL a Turnitin launch page redirects to in JS."""
+    match = _SCRIPT_REDIRECT.search(text or "")
+    if not match:
+        return None
+    try:
+        target = json.loads('"' + match.group(1) + '"')
+    except ValueError:
+        return None
+    target = urljoin(base, target)
+    return target if trusted(target) and (urlsplit(target).hostname or "") in GRADESCOPE else None
+
+
 async def page(client, url: str):
     """Follow the Canvas tool iframe, redirects, and hidden LTI launch forms."""
     method, fields = "GET", None
@@ -519,7 +611,8 @@ async def page(client, url: str):
             raise ValueError("Gradescope launch redirected to an untrusted host")
         await _pause()
         with quiet_http_logs():
-            response = await client.request(method, url, data=fields, follow_redirects=False)
+            response = await client.request(method, url, data=fields, follow_redirects=False,
+                                            headers={"Accept": HTML_ACCEPT})
         parts = urlsplit(url)
         if response.is_redirect:
             location = response.headers.get("location")
@@ -554,7 +647,7 @@ async def page(client, url: str):
                 method, fields = "GET", None
                 continue
         form = document.select_one(
-            'form#tool_form, form:has(input[name="id_token"]), form:has(input[name="lti_message_type"])'
+            'form#tool_form, form[id^="tool_form"], form#no-thirdparty-cookies, form.js-ltiv1p3Return, form:has(input[name="id_token"]), form:has(input[name="lti_message_type"])'
         )
         if form and form.get("method", "get").lower() == "post":
             action = urljoin(url, form.get("action") or url)
@@ -568,6 +661,13 @@ async def page(client, url: str):
             url = action
             method = "POST"
             continue
+        if parts.hostname == TURNITIN_LTI:
+            # Turnitin's /launch page continues with `window.location = redirect_url`
+            # (a Gradescope OIDC login URL) once its state cookie is present.
+            script_redirect = _script_redirect(response.text, url)
+            if script_redirect:
+                url, method, fields = script_redirect, "GET", None
+                continue
         landed = urlsplit(url)
         if landed.hostname not in GRADESCOPE or landed.path.startswith(("/login", "/auth")):
             raise ValueError("Gradescope launch did not reach a student course")
