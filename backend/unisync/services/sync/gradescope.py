@@ -79,6 +79,26 @@ def normalize_title(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
+def _title_tokens(value: object) -> list[str]:
+    """Letter runs and digit runs. '10' stays one token so it does not match '1'."""
+    return re.findall(r"[a-z]+|\d+", normalize_title(value))
+
+
+def _token_span(shorter: list[str], longer: list[str]) -> bool:
+    span = len(shorter)
+    if not span or span > len(longer):
+        return False
+    for start in range(len(longer) - span + 1):
+        if longer[start:start + span] != shorter:
+            continue
+        extra = longer[start + span:start + span + 1]
+        # "Lab 2026" must not swallow "Lab 2026 10", and "1" must not swallow "10".
+        if extra and extra[0].isdigit():
+            continue
+        return True
+    return False
+
+
 def titles_match(left: object, right: object) -> bool:
     a = normalize_title(left)
     b = normalize_title(right)
@@ -86,13 +106,15 @@ def titles_match(left: object, right: object) -> bool:
         return False
     if a == b:
         return True
-    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    if len(shorter) >= 8 and shorter in longer:
-        return True
-    # Spacing differs between Canvas and Gradescope ("MST 2026S2" vs
-    # "MST2026S2-VerA"): compare alphanumerics and allow a version suffix.
-    short, full = sorted((a.replace(" ", ""), b.replace(" ", "")), key=len)
-    return len(short) >= 6 and any(ch.isdigit() for ch in short) and full.startswith(short)
+    left_tokens = _title_tokens(left)
+    right_tokens = _title_tokens(right)
+    shorter, longer = (left_tokens, right_tokens) if len(left_tokens) <= len(right_tokens) else (right_tokens, left_tokens)
+    if not _token_span(shorter, longer):
+        return False
+    # "MST 2026S2" matches "MST2026S2-VerA" (same digit runs, letter suffix).
+    # A lone short word does not match every longer title that contains it.
+    has_digit = any(token.isdigit() for token in shorter)
+    return has_digit or len("".join(shorter)) >= 8
 
 
 def _remember(counts: dict, message: str) -> None:
@@ -249,6 +271,7 @@ def _question_from_props(question: dict) -> dict:
         if text and text not in comments:
             comments.append(text)
     weight = question.get("weight") if question.get("weight") is not None else question.get("points_possible")
+    _sign_rubric_items(question, items, _number(question.get("score")), _number(weight))
     return {
         "id": str(question.get("index") or question.get("id") or ""),
         "title": str(question.get("title") or question.get("name") or ""),
@@ -257,6 +280,63 @@ def _question_from_props(question: dict) -> dict:
         "rubric_items": items,
         "comments": comments,
     }
+
+
+def _scoring_mode(source: dict) -> str | None:
+    if not isinstance(source, dict):
+        return None
+    for key in ("scoring_type", "scoring", "rubric_scoring", "scoring_method"):
+        value = str(source.get(key) or "").casefold()
+        if not value:
+            continue
+        if "neg" in value or "deduct" in value:
+            return "negative"
+        if "pos" in value:
+            return "positive"
+    if source.get("negative_scoring") is True:
+        return "negative"
+    if source.get("positive_scoring") is True:
+        return "positive"
+    if source.get("positive_scoring") is False:
+        return "negative"
+    return None
+
+
+def _sign_rubric_items(question: dict, items: list[dict], score, maximum) -> None:
+    """Store deduction items as negative points and earned items as positive points.
+
+    Gradescope's viewer often sends a positive weight for a deduction ("2" meaning
+    minus 2). The sign is taken from an explicit scoring mode when present, and
+    otherwise from whether the weights add up to the score or to max-minus-score.
+    """
+    numeric = [
+        item for item in items
+        if isinstance(item.get("points"), (int, float)) and not isinstance(item.get("points"), bool)
+    ]
+    if not numeric or any(item["points"] < 0 for item in numeric):
+        return
+    mode = _scoring_mode(question)
+    total = sum(item["points"] for item in numeric)
+    if mode is None and maximum is not None and score is not None:
+        deduction_fits = abs((maximum - total) - score) <= 1e-6
+        positive_fits = abs(total - score) <= 1e-6
+        if deduction_fits and not positive_fits:
+            mode = "negative"
+        elif positive_fits and not deduction_fits:
+            mode = "positive"
+    if mode == "negative":
+        for item in numeric:
+            item["points"] = -item["points"]
+
+
+def _points_suffix(points) -> str:
+    if points is None or isinstance(points, bool):
+        return ""
+    if isinstance(points, float) and points.is_integer():
+        points = int(points)
+    if isinstance(points, (int, float)) and points > 0:
+        return f" (+{points} points)"
+    return f" ({points} points)"
 
 
 def _text_of(entry: object) -> str:
@@ -297,6 +377,7 @@ def _from_viewer(props: dict) -> dict:
             text = _text_of(entry)
             if text and text not in comments:
                 comments.append(text)
+        _sign_rubric_items(question, items, _number(answer.get("score")), _number(question.get("weight")))
         number = str(question.get("full_index") or question.get("index") or qid)
         title = str(question.get("numbered_title") or question.get("title") or "").strip()
         leaves.append({
@@ -516,9 +597,7 @@ def render_markdown(record: dict) -> str:
         lines.append(f'## {question.get("title") or question.get("id") or "Question"}')
         lines.append(f"Score: {qtext}")
         for item in question.get("rubric_items") or []:
-            points = item.get("points")
-            suffix = f" ({points} points)" if points is not None else ""
-            lines.append(f'- {item.get("description") or "Rubric item"}{suffix}')
+            lines.append(f'- {item.get("description") or "Rubric item"}{_points_suffix(item.get("points"))}')
             if item.get("comment"):
                 lines.append(f'  Feedback: {item["comment"]}')
         item_comments = {item.get("comment") for item in question.get("rubric_items") or []}

@@ -53,12 +53,19 @@ https://developerdocs.instructure.com/services/canvas/resources/submissions
 ## Gradescope
 
 Gradescope is read through the Canvas "Gradescope" course tab. UniSync does not
-store a Gradescope password. The resident Camoufox session follows the normal
-student LTI launch (Canvas, `canvas.instructure.com`, `sso.canvaslms.com`, then
-`www.gradescope.com`) and only keeps that student's submission pages. Roster
-tables and other courses are not downloaded. Requests are paced, and failures
-are recorded as a host, path, and status or a short message. Cookies, form
-fields, and query strings are not written to logs or sync status.
+store a Gradescope password. The resident Camoufox session follows the student
+LTI launch. On the live University of Melbourne course that chain is Canvas,
+Turnitin (`lti-gradescope.int.turnitin.com`), `sso.canvaslms.com`, Canvas,
+Turnitin, Gradescope, Turnitin (`lti.int.turnitin.com` for the third-party-cookie
+check), then the Gradescope course. Canvas numbered launch forms
+(`tool_form_<n>`), Turnitin's `#no-thirdparty-cookies` form, a Turnitin
+`redirect_url` that points at Gradescope, and Gradescope's `js-ltiv1p3Return`
+form are submitted. A script redirect to any other host is ignored. Page
+requests send `Accept: text/html` so Gradescope returns the marked submission
+instead of a data-only stub. Only that student's submission pages are kept.
+Roster tables and other courses are not downloaded. Requests are paced, and
+failures are recorded as a host, path, and status or a short message. Cookies,
+form fields, and query strings are not written to logs or sync status.
 
 Each saved submission lands in
 `data/courses/<course_code>/gradescope/<gradescope_course>/<assignment>/<submission>/`:
@@ -71,7 +78,11 @@ Each saved submission lands in
 Unchanged submissions (same submission id, updated time, and content hash, with
 a valid PDF already on disk) are skipped. A regrade replaces the PDF and rewrites
 the JSON and Markdown. When the Gradescope title matches one Canvas assignment,
-`submission.json` records that Canvas assignment id.
+`submission.json` records that Canvas assignment id. Spacing and a trailing
+version suffix still match (`MST 2026S2` and `MST2026S2-VerA`). Digit runs are
+compared whole, so `Lab 2026 1` does not match `Lab 2026 10`. Deduction rubric
+items are stored and shown as negative points (`Incorrect (-2 points)`);
+items that award points keep a positive sign.
 
 `GET /api/v1/sync/submissions/status` includes a `gradescope` object keyed by
 Canvas course id. `no_gradescope_tab` means that course has no Gradescope tab.
@@ -98,10 +109,10 @@ submission `422550001`, and Canvas assignment `661924`.
    `graded.pdf` starts with `%PDF-`. `submission.json` has the total score,
    question scores, applied rubric items, and comments. `feedback.md` is beside it.
 5. Ask the MCP tools for `unisync_get_gradescope_feedback` with course
-   `COMP10001` and assignment `Mid-semester Test`, and
-   `unisync_get_assignment_detail` for Canvas assignment `661924`. The Gradescope
-   score and question comments should appear, and the payload should not contain
-   launch tokens.
+   `COMP10001` and assignment `MST 2026S2` (Gradescope assignment id `8511948`),
+   and `unisync_get_assignment_detail` for Canvas assignment `661924`. The
+   Gradescope score and question comments should appear, and the payload should
+   not contain launch tokens.
 
 Run the same POST again. A second pass with no regrade should increment `cached`
 rather than downloading the PDF again.

@@ -18,7 +18,10 @@ from unisync.services.sync.gradescope import (
     belongs_to_viewer,
     collect_scope,
     link_canvas_assignments,
+    page,
     parse_submission_document,
+    render_markdown,
+    titles_match,
     trusted,
 )
 from unisync.services.sync.submissions import SubmissionSync
@@ -45,6 +48,8 @@ def test_launch_hosts_are_explicit_and_https_only():
     assert trusted("https://sso.canvaslms.com/api/lti/authorize_redirect")
     assert trusted("https://canvas.instructure.com/api/lti/authorize_redirect")
     assert trusted("https://www.gradescope.com/courses/1375834")
+    assert trusted("https://lti-gradescope.int.turnitin.com/launch")
+    assert trusted("https://lti.int.turnitin.com/oidc")
     assert not trusted("http://sso.canvaslms.com/api/lti/authorize_redirect")
     assert not trusted("https://sso.beta.canvaslms.com/api/lti/authorize_redirect")
     assert not trusted("https://sso.canvaslms.com.evil.example/api/lti/authorize_redirect")
@@ -81,6 +86,173 @@ def test_outline_and_react_rubrics_keep_applied_items_only():
     props["owner_id"] = 1
     props["current_user_id"] = 2
     assert not belongs_to_viewer(props)
+
+
+def test_title_match_keeps_digit_runs_intact():
+    assert titles_match("MST 2026S2", "MST2026S2-VerA")
+    assert titles_match("MST2026S2-VerA", "MST 2026S2")
+    assert not titles_match("Lab 2026 1", "Lab 2026 10")
+    assert not titles_match("Lab 2026 10", "Lab 2026 1")
+    assert not titles_match("Week 2", "Week 20")
+    assert titles_match("Mid-semester Test", "COMP10001 Mid-semester Test")
+
+
+def test_live_viewer_signs_deductions_and_earned_points():
+    parsed = parse_submission_document(BeautifulSoup(_html("submission_viewer.html"), "html.parser"))
+    assert parsed["assignment"] == "MST2026S2-VerA"
+    assert parsed["score"] == 36.5
+    assert parsed["submission_id"] == "422550001"
+    assert belongs_to_viewer(parsed)
+    first, sixth = parsed["questions"]
+    assert first["id"] == "1.1"
+    assert first["score"] == 8
+    assert first["points_possible"] == 10
+    assert first["rubric_items"][0]["description"] == "Incorrect"
+    assert first["rubric_items"][0]["points"] == -2
+    assert first["rubric_items"][0]["group"] == "Correctness"
+    assert first["comments"] == ["Watch the range."]
+    assert "No attempt" not in json.dumps(first)
+    assert sixth["score"] == 5
+    assert sixth["rubric_items"][0] == {
+        "description": "Partial credit",
+        "points": 5,
+        "applied": True,
+    }
+    summary = render_markdown({
+        **parsed,
+        "course": "COMP10001_2026_SM1",
+        "canvas_course_id": "241246",
+    })
+    assert "Incorrect (-2 points)" in summary
+    assert "Partial credit (+5 points)" in summary
+    assert "Incorrect (2 points)" not in summary
+
+    explicit = parse_submission_document(BeautifulSoup(
+        '<div data-react-props='
+        '\'{"assignment_submission":{"id":1,"score":"2"},"assignment":{"title":"Lab","total_points":"4"},'
+        '"questions":[{"id":7,"index":"1","title":"Q1","weight":"4","scoring_type":"negative"}],'
+        '"question_submissions":[{"question_id":7,"score":"2"}],'
+        '"rubric_items":[{"question_id":7,"description":"Incorrect","weight":"2","present":true}],'
+        '"inorder_leaf_question_ids":[7]}\'></div>',
+        "html.parser",
+    ))
+    assert explicit["questions"][0]["rubric_items"][0]["points"] == -2
+
+
+COURSE = "https://www.gradescope.com/courses/1375834"
+COURSE_HTML = "<html><body><h1>COMP10001</h1></body></html>"
+
+
+def _accepts(requests: list[httpx.Request]) -> None:
+    assert requests
+    for request in requests:
+        assert request.headers["accept"].startswith("text/html")
+
+
+async def _finish(client, start: str):
+    url, document = await page(client, start)
+    assert urlsplit_host(url) == "www.gradescope.com"
+    assert document.select_one("h1").get_text(strip=True) == "COMP10001"
+    return url
+
+
+def urlsplit_host(url: str) -> str:
+    from urllib.parse import urlsplit
+    return urlsplit(url).hostname or ""
+
+
+@pytest.mark.asyncio
+async def test_numbered_tool_form_posts_to_turnitin():
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "canvas.lms.unimelb.edu.au":
+            return httpx.Response(200, text=_html("tool_form_n.html"))
+        if request.url.host == "lti-gradescope.int.turnitin.com":
+            assert request.method == "POST"
+            assert b"synthetic-launch" in request.content
+            return httpx.Response(302, headers={"location": COURSE})
+        if request.url.path == "/courses/1375834":
+            return httpx.Response(200, text=COURSE_HTML)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        await _finish(client, f"https://{CANVAS}{TOOL}")
+    _accepts(seen)
+    assert [request.url.host for request in seen] == [
+        CANVAS, "lti-gradescope.int.turnitin.com", "www.gradescope.com",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_third_party_cookie_form_posts_to_turnitin_proxy():
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "lti-gradescope.int.turnitin.com":
+            return httpx.Response(200, text=_html("no_thirdparty_cookies.html"))
+        if request.url.host == "lti.int.turnitin.com":
+            assert request.method == "POST"
+            assert b"synthetic-hint" in request.content
+            return httpx.Response(302, headers={"location": COURSE})
+        if request.url.path == "/courses/1375834":
+            return httpx.Response(200, text=COURSE_HTML)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        await _finish(client, "https://lti-gradescope.int.turnitin.com/launch")
+    _accepts(seen)
+
+
+@pytest.mark.asyncio
+async def test_turnitin_script_redirect_stays_on_gradescope():
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "lti-gradescope.int.turnitin.com":
+            return httpx.Response(200, text=_html("turnitin_launch.html"))
+        if request.url.host == "www.gradescope.com" and request.url.path == "/auth/saml/gradescope":
+            return httpx.Response(302, headers={"location": COURSE})
+        if request.url.path == "/courses/1375834":
+            return httpx.Response(200, text=COURSE_HTML)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        await _finish(client, "https://lti-gradescope.int.turnitin.com/launch")
+    assert "evil.example" not in {request.url.host for request in seen}
+    _accepts(seen)
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, text=_html("turnitin_launch_rejected.html"))
+
+    seen.clear()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reject)) as client:
+        with pytest.raises(ValueError, match="did not reach a student course"):
+            await page(client, "https://lti-gradescope.int.turnitin.com/launch")
+    assert [request.url.host for request in seen] == ["lti-gradescope.int.turnitin.com"]
+
+
+@pytest.mark.asyncio
+async def test_lti_v1p3_return_form_is_submitted():
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "lti-gradescope.int.turnitin.com":
+            return httpx.Response(200, text=_html("lti_v1p3_return.html"))
+        if request.method == "POST" and request.url.path == "/courses/1375834":
+            assert b"LtiResourceLinkRequest" in request.content
+            return httpx.Response(200, text=COURSE_HTML)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        await _finish(client, "https://lti-gradescope.int.turnitin.com/launch")
+    assert seen[-1].method == "POST"
+    _accepts(seen)
 
 
 def test_crawl_scope_ignores_rosters_and_other_courses():
