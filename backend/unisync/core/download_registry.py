@@ -314,6 +314,8 @@ class DownloadRegistry:
         raw = item.item_id
         if raw.endswith(":subtitles"):
             raw = raw[: -len(":subtitles")]
+        elif raw.endswith(":video"):
+            raw = raw[: -len(":video")]
         return raw
 
     def _known_lesson_id(self, item: DownloadItem) -> str:
@@ -334,6 +336,8 @@ class DownloadRegistry:
         raw = item.item_id
         if raw.endswith(":subtitles"):
             raw = raw[: -len(":subtitles")]
+        elif raw.endswith(":video"):
+            raw = raw[: -len(":video")]
         return raw if is_api_lesson_id(raw) else ""
 
     def _apply_recording_link(self, item: DownloadItem) -> bool:
@@ -464,6 +468,26 @@ class DownloadRegistry:
             self.flush()
 
         logger.info("Registered download: [%s] %s -> %s (Link: %s)", platform, title, path_str, direct_link)
+        return item
+
+    def update_metadata(
+        self,
+        key: str,
+        extra: dict[str, Any],
+        *,
+        auto_flush: bool = True,
+    ) -> DownloadItem | None:
+        """Merge keys into one item's metadata without changing its file path."""
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                return None
+            meta = dict(item.metadata or {})
+            meta.update(extra)
+            item.metadata = meta
+            self._dirty = True
+        if auto_flush:
+            self.flush()
         return item
 
     def flush(self) -> None:
