@@ -1533,9 +1533,13 @@ async def sync_payload(background_tasks: BackgroundTasks, body: dict[str, Any] =
             _read,
             _write,
             _safe_media_title,
-            _download_and_process_echo360,
             _process,
             Echo360Source,
+        )
+        from unisync.services.sync.lecture_videos import (
+            download_resolved_source,
+            lesson_video_present,
+            videos_enabled,
         )
         
         sections = body["data"]["sections"]
@@ -1808,21 +1812,32 @@ async def sync_payload(background_tasks: BackgroundTasks, body: dict[str, Any] =
                         }
                         _write(item_dir, meta)
                         
-                        # P0-3: route through semaphore-throttled wrappers so at most
-                        # _download_sem / _llm_sem tasks run concurrently, preventing
-                        # OOM from 20×105MB simultaneous video downloads.
-                        if media_url:
-                            background_tasks.add_task(_throttled_download, _download_and_process_echo360, item_id, source_obj)
+                        # Video bytes are opt-in. Subtitles are still saved above.
+                        # UNISYNC_DOWNLOAD_LECTURE_VIDEOS=1 uses the session-aware
+                        # downloader; a normal sync does not pull the recording.
+                        if media_url and videos_enabled():
+                            background_tasks.add_task(
+                                _throttled_download, download_resolved_source, item_id, source_obj
+                            )
+                            sec_queued += 1
+                            total_queued += 1
+                        elif media_url:
+                            meta["status"] = "video_opt_in"
+                            meta["progress"] = (
+                                "Subtitles saved. Video download stays off until "
+                                "UNISYNC_DOWNLOAD_LECTURE_VIDEOS=1 or the lecture video tool runs."
+                            )
+                            _write(item_dir, meta)
                         else:
                             background_tasks.add_task(_throttled_process, _process, item_id)
-                            
+                            sec_queued += 1
+                            total_queued += 1
+
                         existing_ids.add(lesson_id)
-                        sec_queued += 1
-                        total_queued += 1
                         date_str = f" ({lecture_date[:10]})" if lecture_date else ""
                         _record_diff(state, course_name, "NEW_LECTURE", f"+ NEW LECTURE: {title}{date_str}")
                         
-                    elif lesson_id in existing_ids and media_url:
+                    elif lesson_id in existing_ids and media_url and videos_enabled():
                         # Re-queue download for existing items missing their video file.
                         # This handles the case where subtitles were imported first but
                         # video URL resolution failed on a previous sync cycle.
@@ -1836,6 +1851,9 @@ async def sync_payload(background_tasks: BackgroundTasks, body: dict[str, Any] =
                             media_path = existing_dir / mf
                             if media_path.exists() and media_path.stat().st_size > 0:
                                 break  # already has video, skip
+                            from unisync.core.path_service import get_path_service as _video_paths
+                            if lesson_video_present(_video_paths().get_user_root(), lesson_id):
+                                break
                             # Item exists but has no video — queue download
                             source_obj = Echo360Source(
                                 id=lesson_id,
@@ -1852,7 +1870,7 @@ async def sync_payload(background_tasks: BackgroundTasks, body: dict[str, Any] =
                             _write(existing_dir, emeta)
                             # P0-3: use throttled wrapper for re-queue path too
                             background_tasks.add_task(
-                                _throttled_download, _download_and_process_echo360, emeta["id"], source_obj
+                                _throttled_download, download_resolved_source, emeta["id"], source_obj
                             )
                             sec_queued += 1
                             total_queued += 1
