@@ -33,6 +33,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Presenter tracking for the lecture-video picture-in-picture camera circle (optional).
+video-tracking = [
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
