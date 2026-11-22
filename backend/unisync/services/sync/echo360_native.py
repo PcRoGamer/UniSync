@@ -351,6 +351,50 @@ class Echo360NativeIngestor:
                 reason=_failure_reason(exc, browser_ready=False),
             )
 
+    async def resolve_playable(self, record: Mapping[str, Any]) -> IngestOutcome:
+        """Resolve a stream URL even when the transcript is already on disk.
+
+        ``ingest`` returns before opening the player once a VTT is cached.
+        Video download still needs the media URL. Canvas embeds are opened
+        through the same authenticated browser context, so the LTI handshake
+        can create an Echo360 session before player-properties is read.
+        """
+        key = canonical_embed_key(
+            record.get("canvas_course_id"),
+            record.get("uuid") or record.get("media_id"),
+            record.get("link_id"),
+        )
+        lesson_id = embed_lesson_id(
+            record.get("uuid") or record.get("media_id"),
+            record.get("link_id"),
+        )
+        launch_url = self._launch_url(record)
+        if not launch_url:
+            return IngestOutcome(key=key, status="unresolved", reason="missing_launch_url")
+        try:
+            async with self.service._context(headless=True) as context:
+                try:
+                    return await self._ingest_in_context(
+                        context, record, lesson_id, launch_url, key
+                    )
+                except Exception as exc:
+                    logger.info(
+                        "Echo360 media resolve failed after browser start (%s)",
+                        type(exc).__name__,
+                    )
+                    return IngestOutcome(
+                        key=key,
+                        status="error",
+                        reason=_failure_reason(exc, browser_ready=True),
+                    )
+        except Exception as exc:  # pragma: no cover - browser failures are environmental
+            logger.info("Echo360 media resolve failed for %s (%s)", key, type(exc).__name__)
+            return IngestOutcome(
+                key=key,
+                status="error",
+                reason=_failure_reason(exc, browser_ready=False),
+            )
+
     async def _ingest_in_context(
         self,
         context: Any,

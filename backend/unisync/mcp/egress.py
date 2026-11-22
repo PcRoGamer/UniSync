@@ -55,6 +55,16 @@ _SECRET_QUERY = {
     "cookie",
     "password",
     "code",
+    "sessionid",
+    "securelinkaccessdataid",
+    "cloudfront-signature",
+    "cloudfront-policy",
+    "cloudfront-key-pair-id",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-amz-credential",
+    "policy",
+    "key-pair-id",
 }
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]+=*")
@@ -118,14 +128,23 @@ def scrub_recording_url(url: object, *, allow_canvas: bool = False) -> str:
 
 
 def scrub_lecture_payload(payload: Any) -> Any:
-    """Walk a lecture payload and keep only allowlisted recording links."""
+    """Walk a lecture payload and keep only allowlisted recording links.
+
+    Credential-like keys are dropped. Other strings lose access-grant and
+    CloudFront query parameters. Local video paths are left as they are.
+    """
     if isinstance(payload, dict):
         cleaned: dict[Any, Any] = {}
         for key, value in payload.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+            if normalized in _SECRET_KEYS:
+                continue
             if key == "recording_url" and isinstance(value, str):
                 cleaned[key] = scrub_recording_url(value, allow_canvas=True)
             elif key in _RECORDING_KEYS and isinstance(value, str):
                 cleaned[key] = scrub_recording_url(value)
+            elif isinstance(value, str):
+                cleaned[key] = _scrub_text(value)
             else:
                 cleaned[key] = scrub_lecture_payload(value)
         return cleaned

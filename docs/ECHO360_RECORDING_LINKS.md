@@ -44,3 +44,5 @@ After that run, for an Echo360 subtitle entry check:
 - `metadata.recording_url_source` is one of `syllabus`, `media_library`, `embed_catalog`, or `filename`.
 
 `POST /api/v1/sync/inventory/refresh-markdown` rewrites `DOWNLOADS_INVENTORY.md` from the same registry. Echo360 rows with a recording link show it beside the transcript link.
+
+Video files are a separate, opt-in step. See `docs/LECTURE_VIDEO_DOWNLOADS.md`. A normal sync does not download them. After a download, the same manifest row gains `video_status` and `video_filepath`.

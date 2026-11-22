@@ -150,6 +150,9 @@ class CamoufoxService:
             "privacy.clearOnShutdown.offlineApps": False,
             "privacy.clearOnShutdown_v2.cookiesAndStorage": False,
             "network.cookie.lifetimePolicy": 0,
+            # Never play sound on the user's PC: lecture downloads and transcript
+            # ingest start the Echo360 player in this browser.
+            "media.volume_scale": "0.0",
         })
         return options
 

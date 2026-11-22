@@ -838,6 +838,8 @@ def unisync_search_course_materials(
                 row["recording_url_kind"] = item.recording_url_kind or str(
                     (item.metadata or {}).get("recording_url_kind") or ""
                 )
+                from unisync.services.sync.lecture_videos import video_fields_from_item
+                row.update(video_fields_from_item(item))
             scored_matches.append((score, row))
 
     # 3. Direct disk crawl & exact-content grep across data/courses
@@ -1138,6 +1140,27 @@ def unisync_read_course_file(file_path: str, max_chars: int = 8000) -> str:
 # Tool 5: Search Lecture Transcripts
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _lecture_video(vtt_path: Path, lesson_id: str = "") -> dict[str, Any]:
+    """Local video file status for one cached subtitle. Paths only, no media URLs."""
+    from unisync.services.sync.lecture_videos import lookup_video_status
+
+    try:
+        from unisync.core.path_service import get_path_service
+        data_root = get_path_service().get_user_root()
+    except Exception:
+        data_root = vtt_path.parent.parent.parent
+    try:
+        return lookup_video_status(data_root, vtt_path.stem, lesson_id)
+    except Exception:
+        return {
+            "video_downloaded": False,
+            "video_status": "",
+            "video_filepath": "",
+            "video_bytes": 0,
+            "video_quality": "",
+        }
+
+
 def _lecture_recording(vtt_path: Path) -> dict[str, str]:
     """Watch page for one cached subtitle, after the egress allowlist."""
     from unisync.mcp.egress import scrub_recording_url
@@ -1227,6 +1250,7 @@ def unisync_search_lectures(
 
         if matched_cues:
             recording = _lecture_recording(f)
+            video = _lecture_video(f, recording.get("lesson_id", ""))
             for cue in matched_cues:
                 # Echo360 classroom URLs have no start-time parameter.
                 # The cue timestamp stays beside the recording link.
@@ -1240,6 +1264,7 @@ def unisync_search_lectures(
                 "recording_url_kind": recording.get("recording_url_kind", ""),
                 "hit_count": len(matched_cues),
                 "cues": matched_cues,
+                **video,
             })
 
     # Sort most recent lectures first, pushing lectures with unknown dates to the end
@@ -1308,6 +1333,7 @@ def unisync_get_lecture_transcript(
         joined = filter_academic_boilerplate("\n".join(lines))
         truncated = len(joined) > max_chars
         recording = _lecture_recording(matched_file)
+        video = _lecture_video(matched_file, recording.get("lesson_id", ""))
         from unisync.mcp.egress import scrub_lecture_payload
 
         return json.dumps(scrub_lecture_payload({
@@ -1318,9 +1344,56 @@ def unisync_get_lecture_transcript(
             "recording_url_kind": recording.get("recording_url_kind", ""),
             "truncated": truncated,
             "transcript": joined[:max_chars],
+            **video,
         }), indent=2)
     except Exception as exc:
         return json.dumps({"error": f"Failed reading transcript: {exc}"})
+
+
+@mcp.tool()
+async def unisync_download_lecture_videos(
+    course: str,
+    lecture: str = "",
+    limit: int = 1,
+) -> str:
+    """Download lecture video files for one course. This does not run during a normal sync.
+
+    Echo360 course recordings are resolved from the saved syllabus. BLAW module
+    recordings, which only play from inside Canvas, are opened with the saved
+    Canvas session and then saved to disk. Already downloaded files are skipped.
+
+    Args:
+        course: Course code or name, for example COMP10001 or BLAW10001.
+        lecture: Optional date, title fragment, or lesson id. Omit for the newest matches.
+        limit: Maximum number of recordings to download (default 1).
+
+    Returns:
+        JSON with video_status, video_filepath, and video_bytes for each recording.
+        Signed media URLs and session parameters are not included.
+    """
+    from unisync.core.path_service import get_path_service
+    from unisync.mcp.egress import scrub_lecture_payload
+    from unisync.services.sync.lecture_videos import download_lectures
+
+    try:
+        data_root = get_path_service().get_user_root()
+        results = await download_lectures(
+            data_root=data_root,
+            course=course,
+            lecture=lecture,
+            limit=max(1, min(limit, 20)),
+        )
+    except Exception as exc:
+        logger.info("Lecture video download failed (%s)", type(exc).__name__)
+        results = [{
+            "video_status": "failed",
+            "video_downloaded": False,
+            "video_error": "Video download failed before a file was saved.",
+        }]
+    return json.dumps(scrub_lecture_payload({
+        "course": course,
+        "results": results,
+    }), indent=2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
