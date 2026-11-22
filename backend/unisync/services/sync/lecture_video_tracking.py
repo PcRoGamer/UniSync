@@ -5,8 +5,11 @@ often shows the empty lectern while the lecturer stands at one side. This
 module samples the camera feed every couple of seconds at low resolution,
 finds people with a small CPU object detector (NanoDet-Plus through OpenCV's
 DNN module), and plans a smoothed crop that follows whoever is presenting at
-the front of the room. ffmpeg then applies the plan with ``sendcmd`` on a
-``crop`` filter, so the encode itself stays one pass.
+the front of the room, zooming in and out smoothly (like a video-call
+"centre stage"). ffmpeg applies the plan with ``sendcmd``: a ``scale`` whose
+size changes per command does the zoom, and a fixed-size ``crop`` (the circle's
+diameter) does the pan. The camera is only ever scaled down to the size the
+circle needs, so the encode stays one cheap pass.
 
 Nothing here needs a GPU or a network service. OpenCV is optional: without it
 (or without the model file) the plan falls back to the fixed crop.
@@ -17,7 +20,11 @@ Settings (environment):
 * ``UNISYNC_LECTURE_VIDEO_PIP_CROP`` - fixed crop used when tracking is off or unsure:
   ``center`` (default), ``left``, ``right``, or the horizontal centre as a fraction (``0.25``).
 * ``UNISYNC_LECTURE_VIDEO_PIP_ZOOM`` - tracked crop height as a share of the camera height (default 0.6;
-  ``1`` keeps the full height). Several presenters widen it up to the full height.
+  ``1`` keeps the full height). Several presenters ease it wider, up to the full height.
+* ``UNISYNC_LECTURE_VIDEO_PIP_TRACK_DEAD_ZONE`` - ignore presenter moves smaller than this share of the width (default 0.015).
+* ``UNISYNC_LECTURE_VIDEO_PIP_TRACK_GLIDE`` - seconds the crop centre takes to close most of a gap (default 0.5).
+* ``UNISYNC_LECTURE_VIDEO_PIP_TRACK_ZOOM_GLIDE`` - the same for the zoom (default 1.0).
+* ``UNISYNC_LECTURE_VIDEO_PIP_TRACK_MAX_PAN`` - pan speed cap, share of the width per second (default 0.35).
 * ``UNISYNC_LECTURE_VIDEO_PIP_TRACK_INTERVAL`` - seconds between samples (default 2).
 * ``UNISYNC_LECTURE_VIDEO_PIP_TRACK_MIN_SECONDS`` - a person is followed only after being seen this long (default 4).
 * ``UNISYNC_LECTURE_VIDEO_PIP_TRACK_IGNORE_BELOW`` - ignore people whose box starts below this share
@@ -67,9 +74,12 @@ class TrackSettings:
     min_score: float = 0.4
     drop_after: float = 6.0  # a track not seen for this long is forgotten
     lost_hold: float = 10.0  # keep the last framing this long before falling back
-    max_pan: float = 0.12  # crop centre speed cap, share of frame width per second
-    dead_zone: float = 0.04  # ignore target moves smaller than this share of the width
-    step: float = 0.1  # seconds between crop commands (only changes are written)
+    max_pan: float = 0.35  # crop centre speed cap, share of frame width per second
+    dead_zone: float = 0.015  # ignore target moves smaller than this share of the width
+    glide: float = 0.5  # pan time constant, seconds
+    zoom_glide: float = 1.0  # zoom time constant, seconds
+    max_zoom: float = 0.35  # zoom speed cap, share of the camera height per second
+    step: float = 1 / 15  # seconds between crop commands (only changes are written)
     model: str = ""
     download: bool = True
 
@@ -91,6 +101,10 @@ def track_settings() -> TrackSettings:
         min_seconds=_float("UNISYNC_LECTURE_VIDEO_PIP_TRACK_MIN_SECONDS", 4.0, 0.0, 60.0),
         ignore_below=_float("UNISYNC_LECTURE_VIDEO_PIP_TRACK_IGNORE_BELOW", 0.6, 0.1, 1.0),
         min_height=_float("UNISYNC_LECTURE_VIDEO_PIP_TRACK_MIN_HEIGHT", 0.15, 0.0, 0.9),
+        dead_zone=_float("UNISYNC_LECTURE_VIDEO_PIP_TRACK_DEAD_ZONE", 0.015, 0.0, 0.3),
+        glide=_float("UNISYNC_LECTURE_VIDEO_PIP_TRACK_GLIDE", 0.5, 0.05, 10.0),
+        zoom_glide=_float("UNISYNC_LECTURE_VIDEO_PIP_TRACK_ZOOM_GLIDE", 1.0, 0.05, 10.0),
+        max_pan=_float("UNISYNC_LECTURE_VIDEO_PIP_TRACK_MAX_PAN", 0.35, 0.02, 5.0),
         model=os.environ.get("UNISYNC_LECTURE_VIDEO_PIP_MODEL", "").strip(),
         download=os.environ.get("UNISYNC_LECTURE_VIDEO_PIP_MODEL_DOWNLOAD", "").strip().lower() not in _OFF,
     )
@@ -181,7 +195,12 @@ class PresenterTracker:
             best = min(free, key=lambda tr: abs(tr.cx - box.cx), default=None)
             if best is not None and abs(best.cx - box.cx) <= self.match:
                 free.remove(best)
-                best.cx, best.x1, best.x2, best.y1 = box.cx, box.x1, box.x2, box.y1
+                # Average out detector noise on small moves; follow real walks at once.
+                w = 0.5 if abs(best.cx - box.cx) < 0.05 else 1.0
+                best.x1 += w * (box.x1 - best.x1)
+                best.x2 += w * (box.x2 - best.x2)
+                best.y1 += w * (box.y1 - best.y1)
+                best.cx = (best.x1 + best.x2) / 2
                 best.last = t
                 best.hits += 1
             else:
@@ -210,19 +229,20 @@ class PresenterTracker:
 
 @dataclass
 class CropKey:
-    """Crop state from ``t`` on. Both crops follow the same centre; ``wide`` picks which one is shown."""
+    """Square crop of the camera from ``t`` on, in camera pixels."""
 
     t: float
-    x_tight: int
-    y_tight: int
-    x_wide: int
-    wide: bool
+    x: float
+    y: float
+    side: float
 
 
 @dataclass
 class CropPlan:
     keys: list[CropKey] = field(default_factory=list)
-    tight: int = 0  # tracked crop side, px
+    width: int = 0  # camera frame size
+    height: int = 0
+    tight: int = 0  # crop side for one presenter, px
     full: int = 0  # widest crop side (camera height), px
     note: str = ""
     tracked_share: float = 0.0  # share of samples that followed a person
@@ -236,84 +256,99 @@ def _even(value: float) -> int:
     return int(round(value / 2)) * 2
 
 
-def plan_crop(targets: Sequence[Target], width: int, height: int, settings: TrackSettings) -> CropPlan:
-    """Turn per-sample targets into smoothed crop keyframes (pixels) every ``settings.step`` seconds.
+def _ease(current: float, goal: float, step: float, tau: float, cap: float) -> float:
+    """Exponential approach (time constant ``tau``) with a speed cap; frame-rate independent."""
+    import math
 
-    Two crop sizes exist: ``tight`` (``zoom`` x camera height) follows one presenter,
-    ``full`` (the camera height) fits several presenters or is the fixed fallback.
-    ffmpeg cannot resize a crop mid-stream, so the size switches between the two
-    while the centre glides.
+    move = (goal - current) * (1 - math.exp(-step / max(tau, 1e-6)))
+    return current + max(-cap, min(cap, move))
+
+
+def plan_crop(targets: Sequence[Target], width: int, height: int, settings: TrackSettings) -> CropPlan:
+    """Turn per-sample targets into an eased crop path (centre and size) every ``settings.step`` seconds.
+
+    One presenter: ``zoom`` x camera height, centred on them. Several: eased wider
+    until they fit (up to the camera height). Nobody or too far apart: the fixed
+    crop at full height. Centre and size glide; nothing jumps.
     """
     if not targets or width <= 0 or height <= 0:
         return CropPlan(note="no samples")
-    full = _even(min(width, height))
-    tight = max(32, min(full, _even(height * settings.zoom)))
+    full = float(min(width, height))
+    tight = float(max(32, min(full, height * settings.zoom)))
     fallback_cx = fixed_center(settings.crop) * width
 
-    def wanted(tg: Target) -> tuple[float, bool, float]:
-        """(centre x px, wide?, top y px) the target asks for."""
+    def wanted(tg: Target) -> tuple[float, float, float]:
+        """(centre x px, side px, top y px) the target asks for."""
         if tg.cx is None:
-            return fallback_cx, True, 0.0
+            return fallback_cx, full, 0.0
         need = tg.span * width * 1.15
         if need > full:  # people too far apart for one circle: fixed framing
-            return fallback_cx, True, 0.0
-        wide = need > tight
-        top = 0.0 if wide else max(0.0, tg.top * height - 0.12 * tight)
-        return tg.cx * width, wide, top
+            return fallback_cx, full, 0.0
+        side = max(tight, need)
+        return tg.cx * width, side, max(0.0, tg.top * height - 0.12 * side)
 
     keys: list[CropKey] = []
-    cx, wide, top = wanted(targets[0])
-    goal = (cx, wide, top)
+    cx, side, top = wanted(targets[0])
+    goal = (cx, side, top)
     idx = 0
     t = targets[0].t
     end = targets[-1].t + settings.interval
-    max_move = settings.max_pan * width * settings.step
+    step = settings.step
+    pan_cap = settings.max_pan * width * step
+    zoom_cap = settings.max_zoom * height * step
     while t <= end + 1e-9:
         while idx + 1 < len(targets) and targets[idx + 1].t <= t + 1e-9:
             idx += 1
             new = wanted(targets[idx])
-            # Dead zone: small shuffles of the presenter do not move the crop.
-            if (abs(new[0] - goal[0]) > settings.dead_zone * width or new[1] != goal[1]
+            # Dead zone: detector noise and small shuffles do not move the crop.
+            if (abs(new[0] - goal[0]) > settings.dead_zone * width or abs(new[1] - goal[1]) > 0.02 * full
                     or abs(new[2] - goal[2]) > settings.dead_zone * height):
                 goal = new
-        # Ease toward the goal with a speed cap: no jitter, no whip pans.
-        cx += max(-max_move, min(max_move, (goal[0] - cx) * 0.35))
-        top += max(-max_move, min(max_move, (goal[2] - top) * 0.35))
-        wide = goal[1]
-        key = CropKey(
-            round(t, 3),
-            _even(min(width - tight, max(0.0, cx - tight / 2))),
-            _even(min(height - tight, max(0.0, top))),
-            _even(min(width - full, max(0.0, cx - full / 2))),
-            wide,
-        )
-        if not keys or (keys[-1].x_tight, keys[-1].y_tight, keys[-1].x_wide, keys[-1].wide) != (
-            key.x_tight, key.y_tight, key.x_wide, key.wide
-        ):
+        cx = _ease(cx, goal[0], step, settings.glide, pan_cap)
+        side = _ease(side, goal[1], step, settings.zoom_glide, zoom_cap)
+        top = _ease(top, goal[2], step, settings.glide, pan_cap)
+        s_px = min(full, max(32.0, side))
+        x_px = min(width - s_px, max(0.0, cx - s_px / 2))
+        y_px = min(height - s_px, max(0.0, top))
+        key = CropKey(round(t, 3), round(x_px, 1), round(y_px, 1), round(s_px, 1))
+        if not keys or abs(keys[-1].x - key.x) >= 1 or abs(keys[-1].y - key.y) >= 1 or abs(keys[-1].side - key.side) >= 1:
             keys.append(key)
-        t += settings.step
+        t += step
     followed = sum(1 for tg in targets if tg.cx is not None) / len(targets)
-    return CropPlan(keys=keys, tight=tight, full=full, tracked_share=followed,
-                    note=f"followed {followed:.0%} of samples")
+    return CropPlan(keys=keys, width=width, height=height, tight=int(tight), full=int(full),
+                    tracked_share=followed, note=f"followed {followed:.0%} of samples")
 
 
-def sendcmd_text(plan: CropPlan) -> str:
-    """ffmpeg ``sendcmd`` script for ``crop@tight``, ``crop@wide`` and ``streamselect@zoom``."""
+def render_values(key: CropKey, width: int, height: int, diameter: int) -> tuple[int, int, int, int]:
+    """(scaled width, scaled height, crop x, crop y) that show ``key`` in a ``diameter`` square.
+
+    The camera is scaled by ``diameter / side`` (a downscale unless the crop is
+    smaller than the circle), then a ``diameter`` square is cut out.
+    """
+    k = diameter / max(1.0, key.side)
+    sw = max(diameter, _even(width * k))
+    sh = max(diameter, _even(height * k))
+    x = int(round(min(sw - diameter, max(0.0, key.x * k))))
+    y = int(round(min(sh - diameter, max(0.0, key.y * k))))
+    return sw, sh, x, y
+
+
+def sendcmd_text(plan: CropPlan, diameter: int) -> str:
+    """ffmpeg ``sendcmd`` script driving ``scale@zoom`` (zoom) and ``crop@pan`` (position)."""
     lines = []
-    prev: CropKey | None = None
+    prev: tuple[int, int, int, int] | None = None
     for key in plan.keys:
+        sw, sh, x, y = render_values(key, plan.width, plan.height, diameter)
         parts = []
-        if prev is None or key.x_tight != prev.x_tight:
-            parts.append(f"crop@tight x {key.x_tight}")
-        if prev is None or key.y_tight != prev.y_tight:
-            parts.append(f"crop@tight y {key.y_tight}")
-        if prev is None or key.x_wide != prev.x_wide:
-            parts.append(f"crop@wide x {key.x_wide}")
-        if prev is None or key.wide != prev.wide:
-            parts.append(f"streamselect@zoom map {1 if key.wide else 0}")
+        if prev is None or (sw, sh) != prev[:2]:
+            parts += [f"scale@zoom w {sw}", f"scale@zoom h {sh}"]
+        if prev is None or x != prev[2]:
+            parts.append(f"crop@pan x {x}")
+        if prev is None or y != prev[3]:
+            parts.append(f"crop@pan y {y}")
         if parts:
             lines.append(f"{key.t:.3f} " + ", ".join(parts) + ";")
-        prev = key
+        prev = (sw, sh, x, y)
     return "\n".join(lines) + "\n"
 
 

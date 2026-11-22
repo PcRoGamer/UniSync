@@ -68,19 +68,19 @@ def test_two_presenters_widen_or_fall_back():
     near = _run(PresenterTracker(s), [[LECTURER, guest]] * 4)[-1]
     assert near.mode == "group" and near.span == pytest.approx(0.38)
     plan = tracking.plan_crop([near] * 4, 1280, 720, s)
-    assert plan.keys[-1].wide is True  # span needs more than the tight crop
+    assert plan.keys[-1].side == pytest.approx(0.38 * 1280 * 1.15, abs=1)  # wide enough for both
     far = Box(0.85, 0.25, 0.95, 0.95)
     apart = _run(PresenterTracker(s), [[LECTURER, far]] * 4)[-1]
     plan = tracking.plan_crop([apart] * 4, 1280, 720, _settings(crop="right"))
-    assert plan.keys[-1].wide and plan.keys[-1].x_wide == 1280 - 720  # fixed fallback framing
+    assert plan.keys[-1].side == 720 and plan.keys[-1].x == 1280 - 720  # fixed fallback framing
 
 
 def test_plan_is_smooth_and_capped():
     s = _settings()
     targets = [Target(t=i * 2.0, cx=0.1 if i < 5 else 0.9, span=0.1, top=0.25, mode="presenter") for i in range(15)]
     plan = tracking.plan_crop(targets, 1280, 720, s)
-    xs = [k.x_tight for k in plan.keys]
-    cap = s.max_pan * 1280 * s.step + 2
+    xs = [k.x for k in plan.keys]
+    cap = s.max_pan * 1280 * s.step + 1
     assert all(abs(b - a) <= cap for a, b in zip(xs, xs[1:]))
     assert xs[0] == 0 and xs[-1] == 1280 - plan.tight
     assert plan.tight == 432 and plan.full == 720
@@ -91,10 +91,47 @@ def test_jitter_inside_dead_zone_does_not_move_crop():
     import random
 
     rng = random.Random(1)
-    targets = [Target(t=i * 2.0, cx=0.5 + rng.uniform(-0.015, 0.015), span=0.1, top=0.25, mode="presenter")
+    targets = [Target(t=i * 2.0, cx=0.5 + rng.uniform(-0.007, 0.007), span=0.1, top=0.25, mode="presenter")
                for i in range(30)]
     plan = tracking.plan_crop(targets, 1280, 720, s)
-    assert len({k.x_tight for k in plan.keys}) == 1
+    assert len({k.x for k in plan.keys}) == 1
+
+
+def test_presenter_ends_up_centred_in_the_circle():
+    s = _settings()
+    targets = [Target(t=i * 2.0, cx=0.30 if i < 3 else 0.55, span=0.1, top=0.25, mode="presenter") for i in range(8)]
+    plan = tracking.plan_crop(targets, 1280, 720, s)
+    settled = [k for k in plan.keys if k.t <= 6 + 2.0][-1]  # 2 s after the presenter moved
+    assert abs(settled.x + settled.side / 2 - 0.55 * 1280) <= 0.02 * 1280
+    small_move = [Target(t=i * 2.0, cx=0.50 if i < 3 else 0.525, span=0.1, top=0.25, mode="presenter") for i in range(8)]
+    keys = tracking.plan_crop(small_move, 1280, 720, s).keys
+    assert keys[-1].x + keys[-1].side / 2 == pytest.approx(0.525 * 1280, abs=3)  # 2.5% move is followed
+
+
+def test_zoom_eases_out_for_a_group_and_back_in():
+    s = _settings()
+    one = dict(cx=0.5, span=0.1, top=0.25, mode="presenter")
+    group = dict(cx=0.5, span=0.45, top=0.25, mode="group")
+    seq = [one] * 3 + [group] * 4 + [one] * 5
+    targets = [Target(t=i * 2.0, **kw) for i, kw in enumerate(seq)]
+    plan = tracking.plan_crop(targets, 1280, 720, s)
+    sides = [k.side for k in plan.keys]
+    cap = s.max_zoom * 720 * s.step + 1
+    assert all(abs(b - a) <= cap for a, b in zip(sides, sides[1:]))  # no cut, only easing
+    assert min(sides) == pytest.approx(432) and max(sides) == pytest.approx(min(720, 0.45 * 1280 * 1.15), abs=1)
+    widest = sides.index(max(sides))
+    assert sides[0] == pytest.approx(432) and sides[-1] == pytest.approx(432, abs=1)  # eased back in
+    steps = [k.t for k in plan.keys if 432 < k.side < max(sides) - 1]
+    assert steps and max(steps) - min(steps) > 1.0  # the transitions take time
+    assert 0 < widest < len(sides) - 1
+
+
+def test_render_values_scale_down_to_the_circle():
+    key = tracking.CropKey(0.0, 0.0, 100.0, 432.0)
+    sw, sh, x, y = tracking.render_values(key, 1280, 720, 282)
+    assert (sw, sh) == (836, 470) and x == 0 and y == 65
+    wide = tracking.render_values(tracking.CropKey(0.0, 560.0, 0.0, 720.0), 1280, 720, 282)
+    assert wide[1] == 282 and abs(wide[2] - (wide[0] - 282)) <= 1
 
 
 def test_fixed_center_parsing():
@@ -115,14 +152,14 @@ def test_settings_from_env(monkeypatch):
 
 def test_sendcmd_writes_only_changes():
     plan = tracking.CropPlan(
-        keys=[tracking.CropKey(0.0, 10, 20, 0, False), tracking.CropKey(0.1, 12, 20, 0, False),
-              tracking.CropKey(0.2, 12, 20, 0, True)],
-        tight=432, full=720,
+        keys=[tracking.CropKey(0.0, 0.0, 100.0, 432.0), tracking.CropKey(0.1, 20.0, 100.0, 432.0),
+              tracking.CropKey(0.2, 20.0, 100.0, 500.0)],
+        width=1280, height=720, tight=432, full=720,
     )
-    lines = tracking.sendcmd_text(plan).strip().splitlines()
-    assert lines[0] == "0.000 crop@tight x 10, crop@tight y 20, crop@wide x 0, streamselect@zoom map 0;"
-    assert lines[1] == "0.100 crop@tight x 12;"
-    assert lines[2] == "0.200 streamselect@zoom map 1;"
+    lines = tracking.sendcmd_text(plan, 282).strip().splitlines()
+    assert lines[0] == "0.000 scale@zoom w 836, scale@zoom h 470, crop@pan x 0, crop@pan y 65;"
+    assert lines[1] == "0.100 crop@pan x 13;"
+    assert lines[2].startswith("0.200 scale@zoom w 722, scale@zoom h 406")
 
 
 def test_track_camera_falls_back_without_detector(monkeypatch, tmp_path):
@@ -140,10 +177,9 @@ def test_filters_for_fixed_and_tracked_crop():
     s = feeds.PipSettings()
     fixed = feeds.pip_filter(1280, s, {"mode": "fixed", "center": 0.0})
     assert "max(0,min(iw-ow,0*iw-ow/2))" in fixed and "sendcmd" not in fixed
-    key = tracking.CropKey(0.0, 0, 100, 0, False)
-    tracked = feeds.pip_filter(1280, s, {"mode": "tracked", "cmd": "x.cmd", "tight": 432, "full": 720, "first": key})
-    assert "sendcmd=f=x.cmd" in tracked and "crop@tight=w=432:h=432:x=0:y=100" in tracked
-    assert "streamselect@zoom=inputs=2:map=0" in tracked
+    tracked = feeds.pip_filter(1280, s, {"mode": "tracked", "cmd": "x.cmd", "first": (836, 470, 0, 65)})
+    assert "sendcmd=f=x.cmd" in tracked and "scale@zoom=w=836:h=470" in tracked
+    assert "crop@pan=w=282:h=282:x=0:y=65" in tracked and "streamselect" not in tracked
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
@@ -154,7 +190,8 @@ def test_tracked_pip_renders_with_synthetic_plan(monkeypatch, tmp_path):
              "-f", "lavfi", "-i", "sine=d=3", "-shortest", "-c:v", "libx264", "-preset", "ultrafast", str(tmp_path / name)],
             check=True,
         )
-    targets = [Target(t=i * 1.0, cx=0.1 if i < 2 else 0.9, span=0.1, top=0.2, mode="presenter") for i in range(4)]
+    targets = [Target(t=i * 1.0, cx=0.1 if i < 2 else 0.6, span=0.1 if i != 2 else 0.6, top=0.2, mode="presenter")
+               for i in range(4)]
     plan = tracking.plan_crop(targets, 640, 360, _settings(interval=1.0))
     monkeypatch.setattr(tracking, "track_camera", lambda *a, **k: plan)
     notes: dict[str, str] = {}

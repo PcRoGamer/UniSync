@@ -218,13 +218,13 @@ def probe_streams(path: Path) -> dict[str, Any]:
 def _camera_chain(diameter: int, camera: Mapping[str, Any] | None) -> str:
     """Filter chain from the camera input to a ``diameter`` square, fixed or presenter-tracked."""
     if camera and camera.get("mode") == "tracked":
-        first = camera["first"]
-        tight, full = int(camera["tight"]), int(camera["full"])
+        # Zoom = a scale whose size the plan changes per command; pan = a fixed
+        # diameter-sized crop. The camera is only scaled down as far as the circle needs.
+        sw, sh, x, y = camera["first"]
         return (
-            f"[1:v]sendcmd=f={camera['cmd']},split[ct][cw];"
-            f"[ct]crop@tight=w={tight}:h={tight}:x={first.x_tight}:y={first.y_tight},scale={diameter}:{diameter}[camt];"
-            f"[cw]crop@wide=w={full}:h={full}:x={first.x_wide}:y=0,scale={diameter}:{diameter}[camw];"
-            f"[camt][camw]streamselect@zoom=inputs=2:map={1 if first.wide else 0},format=yuva420p[cam]"
+            f"[1:v]sendcmd=f={camera['cmd']},"
+            f"scale@zoom=w={sw}:h={sh}:flags=bilinear,"
+            f"crop@pan=w={diameter}:h={diameter}:x={x}:y={y},format=yuva420p[cam]"
         )
     center = float((camera or {}).get("center", 0.5))
     center = min(1.0, max(0.0, center))
@@ -234,12 +234,16 @@ def _camera_chain(diameter: int, camera: Mapping[str, Any] | None) -> str:
     )
 
 
+def circle_diameter(screen_width: int, settings: PipSettings) -> int:
+    return max(32, int(round(screen_width * settings.size / 2)) * 2)
+
+
 def pip_filter(screen_width: int, settings: PipSettings, camera: Mapping[str, Any] | None = None) -> str:
     """Screen full frame, camera cropped square, masked to a circle, placed in a corner.
 
     ``camera`` is ``{"mode": "fixed", "center": 0.5}`` or a tracked plan from ``camera_crop``.
     """
-    diameter = max(32, int(round(screen_width * settings.size / 2)) * 2)
+    diameter = circle_diameter(screen_width, settings)
     margin = int(round(screen_width * settings.margin))
     x = f"W-w-{margin}" if "right" in settings.position else str(margin)
     y = f"{margin}" if "top" in settings.position else f"H-h-{margin}"
@@ -315,7 +319,7 @@ def pip_argv(ffmpeg: str, screen: Path, camera: Path, dest: Path, *, screen_widt
     ]
 
 
-async def camera_crop(camera: Path, dest: Path) -> dict[str, Any]:
+async def camera_crop(camera: Path, dest: Path, diameter: int = 0) -> dict[str, Any]:
     """Fixed crop, or a presenter-tracking plan written as an ffmpeg ``sendcmd`` file beside ``dest``."""
     from unisync.services.sync import lecture_video_tracking as tracking
 
@@ -329,10 +333,12 @@ async def camera_crop(camera: Path, dest: Path) -> dict[str, Any]:
         return {**fixed, "note": f"fixed {tsettings.crop} ({plan.note})"}
     # A plain file name: ffmpeg runs in dest's folder, so no path escaping inside the filter graph.
     name = f"pip-track-{os.getpid()}.cmd"
-    (Path(dest).parent / name).write_text(tracking.sendcmd_text(plan), encoding="ascii")
+    diameter = diameter or circle_diameter(1920, pip_settings())
+    (Path(dest).parent / name).write_text(tracking.sendcmd_text(plan, diameter), encoding="ascii")
     return {
         "mode": "tracked", "cmd": name, "cmd_path": str(Path(dest).parent / name),
-        "tight": plan.tight, "full": plan.full, "first": plan.keys[0], "note": f"tracked ({plan.note})",
+        "first": tracking.render_values(plan.keys[0], plan.width, plan.height, diameter),
+        "note": f"tracked ({plan.note})",
     }
 
 
@@ -350,7 +356,7 @@ async def build_pip(
     encoder = pick_encoder(ffmpeg, settings.encoder)
     part = dest.with_name(dest.name + ".part.mp4")
     attempts = [encoder] if encoder == "libx264" else [encoder, "libx264"]
-    crop = await camera_crop(camera, dest)
+    crop = await camera_crop(camera, dest, circle_diameter(int(width), settings))
     if notes is not None:
         notes["crop"] = str(crop.get("note") or "")
     try:

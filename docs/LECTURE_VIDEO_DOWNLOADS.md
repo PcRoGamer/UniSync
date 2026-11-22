@@ -88,8 +88,8 @@ The camera is usually a wide shot of the room, so a fixed centre crop can show a
 * Audience heads in the bottom rows and small boxes are ignored.
 * Someone who appears for less than 4 seconds, such as a student walking past, is never followed.
 * If the presenter is briefly not detected (turned away, walked behind the lectern), the last framing is held for 10 seconds. After that the circle falls back to the fixed crop.
-* Several presenters widen the circle to the full camera height to fit them. If they are too far apart even for that, the fixed crop is used.
-* The crop centre eases toward the target with a speed cap and a dead zone, so it doesn't jitter. ffmpeg applies the plan with `sendcmd` on the crop during the single encode pass.
+* The presenter is kept near the centre of the circle. One presenter gets a tight framing (60% of the camera height). When several present together the circle zooms out smoothly until they all fit (up to the full camera height), then zooms back in when one is left, like a video call's "centre stage". If they are too far apart even for the full height, the fixed crop is used.
+* Position and zoom ease toward the target (a time constant plus a speed cap) and ignore moves inside a small dead zone, so the circle glides instead of jittering or cutting. ffmpeg applies the plan with `sendcmd` during the single encode pass: a `scale` whose size changes per command does the zoom and a fixed circle-sized `crop` does the pan. The camera is only ever scaled down to the size the circle needs.
 
 Tracking adds about one minute of CPU for a one-hour lecture (one decode pass of the camera feed plus about 1,650 detections).
 
@@ -102,6 +102,10 @@ Tracking adds about one minute of CPU for a one-hour lecture (one decode pass of
 | `UNISYNC_LECTURE_VIDEO_PIP_TRACK_MIN_SECONDS` | `4` | how long someone must be visible before the circle follows them |
 | `UNISYNC_LECTURE_VIDEO_PIP_TRACK_IGNORE_BELOW` | `0.6` | ignore people whose box starts below this share of the frame height |
 | `UNISYNC_LECTURE_VIDEO_PIP_TRACK_MIN_HEIGHT` | `0.15` | ignore boxes shorter than this share of the frame height |
+| `UNISYNC_LECTURE_VIDEO_PIP_TRACK_DEAD_ZONE` | `0.015` | ignore presenter moves smaller than this share of the width |
+| `UNISYNC_LECTURE_VIDEO_PIP_TRACK_GLIDE` | `0.5` | seconds the circle takes to close most of a gap when panning |
+| `UNISYNC_LECTURE_VIDEO_PIP_TRACK_ZOOM_GLIDE` | `1.0` | the same for zooming in and out |
+| `UNISYNC_LECTURE_VIDEO_PIP_TRACK_MAX_PAN` | `0.35` | pan speed cap, share of the width per second |
 | `UNISYNC_LECTURE_VIDEO_PIP_MODEL` | `<data>/models/object_detection_nanodet_2022nov.onnx` | model file |
 | `UNISYNC_LECTURE_VIDEO_PIP_MODEL_DOWNLOAD` | on | `0` never fetches the model; without it tracking falls back to the fixed crop |
 
