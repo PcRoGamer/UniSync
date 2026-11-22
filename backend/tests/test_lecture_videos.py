@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import json
 from pathlib import Path
 from urllib.parse import urlparse
@@ -241,7 +243,8 @@ async def test_echo360_course_mp4_is_saved_once_and_recorded(data_root: Path, mo
     assert "Signature" not in blob
     assert "Policy" not in blob
     assert "ECHO_JWT" not in blob
-    assert first["video_filepath"] in blob
+    # json.dumps escapes Windows backslashes, so compare the encoded form.
+    assert json.dumps(first["video_filepath"])[1:-1] in blob
     second = await download_one(targets[0], client=client, data_root=data_root, registry=registry, max_size=1000)
     assert second["video_status"] == "skipped"
     assert client.streams == 1
@@ -465,3 +468,167 @@ def test_egress_keeps_a_local_video_path_and_drops_cdn_secrets() -> None:
     assert "CloudFront-Signature" not in cleaned["note"]
     assert "sessionId" not in cleaned["note"]
     assert "focus=Video" in cleaned["note"]
+
+
+# --- live-test fixes: signed CDN query, pre-roll disclaimer, duration guard, mute ---
+
+from unisync.services.sync import lecture_videos as _lv  # noqa: E402
+
+CDN = "https://content.echo360.net.au/0000.inst/" + MEDIA + "/3/"
+
+
+def _properties(media_id: str, seconds: float, *, base: str = CDN) -> dict:
+    return {"data": {
+        "playableAudioVideo": {
+            "duration": f"PT{seconds}S",
+            "mediaId": media_id,
+            "playableMedias": [
+                {"isHls": True, "trackType": ["Audio"], "uri": base + "s0_a.m3u8?x-act=1&x-mid=2"},
+                {"isHls": True, "trackType": ["Video"], "uri": base + "s1_v.m3u8?x-act=1&x-mid=2"},
+                {"isHls": True, "trackType": ["Audio", "Video"], "uri": base + "s1_av.m3u8?x-act=1&x-mid=2"},
+            ],
+        },
+        "sourceQueryStrings": {"queryStrings": [{
+            "uriPattern": "^https://.*\\.echo360\\.net\\.au/0000\\.inst/" + media_id + "/3/.*$",
+            "queryString": "Policy=p&Signature=s&Key-Pair-Id=k&x-uid=u",
+        }]},
+    }}
+
+
+def test_iso_duration_parses_echo360_values() -> None:
+    assert _lv.parse_iso_duration("PT982.867S") == pytest.approx(982.867)
+    assert _lv.parse_iso_duration("PT1H2M3S") == 3723
+    assert _lv.parse_iso_duration("") == 0
+
+
+def test_player_uri_query_is_swapped_for_the_cloudfront_signature() -> None:
+    choice = choose_playable(_properties(MEDIA, 3000), max_height_px=720)
+    assert choice is not None
+    query = urlparse(choice.url).query
+    assert "Signature=s" in query and "Key-Pair-Id=k" in query
+    assert "x-act" not in query
+    # Audio+video wins over the silent video-only rendition.
+    assert urlparse(choice.url).path.endswith("/s1_av.m3u8")
+    assert choice.duration == 3000 and choice.media_id == MEDIA
+
+
+def test_the_longest_media_wins_over_the_disclaimer_pre_roll() -> None:
+    disclaimer = "d1500000-0000-4000-8000-000000000000"
+    pre = _properties(disclaimer, 15.2, base="https://content.echo360.net.au/0000.inst/" + disclaimer + "/3/")
+    lecture = _properties(MEDIA, 2950.0)
+    for order in ([pre, lecture], [lecture, pre]):
+        choice = _lv.choose_main_lecture(order, max_height_px=720)
+        assert choice is not None and choice.media_id == MEDIA and choice.duration == 2950.0
+
+
+async def test_browser_capture_is_used_when_http_properties_fail(data_root: Path) -> None:
+    _syllabus(data_root)
+    target = select_targets(data_root, course="COMP10001")[0]
+
+    class CaptureClient(MapClient):
+        async def capture_properties(self, page_url: str) -> list:
+            return [_properties("d1500000-0000-4000-8000-000000000000", 15), _properties(MEDIA, 3100)]
+
+    client = CaptureClient()
+    choice, note = await _lv.resolve_media(target, client, max_height_px=720, max_size=10**9)
+    assert note == "" and choice is not None
+    assert choice.media_id == MEDIA and choice.duration == 3100
+
+
+async def test_short_file_is_flagged_not_downloaded(data_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _syllabus(data_root)
+    target = select_targets(data_root, course="COMP10001")[0]
+    client = MapClient()
+    client.files[MP4] = b"disclaimer"
+    monkeypatch.setattr(_lv, "probe_duration", lambda path: 15.0)
+    result = await _lv._store_choice(
+        target, MediaChoice(container="mp4", url=MP4, label="hd"),
+        client=client, dest_dir=data_root / "lecture_videos" / "COMP10001",
+        registry=_registry(data_root), max_height_px=720, max_size=1000,
+    )
+    assert result["video_status"] == "suspicious_short"
+    assert result["video_downloaded"] is False
+    assert result["video_duration_seconds"] == 15
+    assert "disclaimer" in result["video_error"]
+    # A later run does not treat the short file as the lecture; it is renamed, not deleted.
+    monkeypatch.setattr(_lv, "probe_duration", lambda path: 15.0 if "short" not in path.name else 15.0)
+    assert _lv._too_short(Path(result["video_filepath"]))
+
+
+async def test_long_file_records_its_duration(data_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _syllabus(data_root)
+    target = select_targets(data_root, course="COMP10001")[0]
+    client = MapClient()
+    client.files[MP4] = b"lecture"
+    monkeypatch.setattr(_lv, "probe_duration", lambda path: 2950.4)
+    result = await _lv._store_choice(
+        target, MediaChoice(container="mp4", url=MP4, label="hd"),
+        client=client, dest_dir=data_root / "lecture_videos" / "COMP10001",
+        registry=_registry(data_root), max_height_px=720, max_size=1000,
+    )
+    assert result["video_status"] == "downloaded" and result["video_duration_seconds"] == 2950
+
+
+def test_unrecorded_timetable_slots_are_skipped_without_a_lecture_filter(data_root: Path) -> None:
+    _syllabus(data_root)
+    targets = select_targets(data_root, course="COMP10001")
+    slot = VideoTarget(**{**targets[0].__dict__, "lesson_id": "G_slot", "media_id": "", "date": "2099-01-01"})
+    ordered = [slot] + targets
+    recorded = [t for t in ordered if t.source != "echo360_course" or t.media_id]
+    assert recorded and recorded[0].media_id
+
+
+def test_browser_is_launched_muted() -> None:
+    import inspect
+    from unisync.services.browser import camoufox_service
+    from unisync.services.sync import lecture_video_browser
+
+    assert '"media.volume_scale": "0.0"' in inspect.getsource(camoufox_service.CamoufoxService._launch_options)
+    script = lecture_video_browser.MUTE_SCRIPT
+    assert "muted = true" in script and "volume = 0" in script
+
+
+
+class _CaptureClient:
+    def __init__(self, files, note=""):
+        self.files, self.note, self.calls = files, note, []
+
+    async def lesson_files(self, record, media_id, lesson_id, *, full=True):
+        self.calls.append((record.get("lecture_capture_url"), media_id, lesson_id, full))
+        return {"files": self.files, "labels": {1: "Full", 2: "Full"}, "muted": True, "note": self.note}
+
+
+def _capture_target(**extra):
+    base = dict(
+        lesson_id="G_x", title="t", course_id="sec", course_name="C", date="", kind="echo360_lesson",
+        media_id="m1", public_id="", secure_id="", page_url="https://echo360.net.au/lesson/G_x/classroom",
+        recording_url="", source="echo360_course",
+        record={"lecture_capture_url": "https://canvas.lms.unimelb.edu.au/courses/1/external_tools/701"},
+    )
+    base.update(extra)
+    return _lv.VideoTarget(**base)
+
+
+def test_lecture_capture_choice_keeps_both_feeds():
+    files = {1: "https://content.echo360.net.au/a/m1/1/hd1.mp4?Signature=x", 2: "https://content.echo360.net.au/a/m1/1/hd2.mp4?Signature=y"}
+    client = _CaptureClient(files)
+    choice, note = asyncio.run(_lv._choice_from_lecture_capture(client, _capture_target(), max_height_px=1080))
+    assert note == "" and choice is not None
+    assert choice.url == files[1] and choice.feed_urls == files
+    assert choice.roles == {"screen": 1, "camera": 2} and choice.label == "hd"
+    assert client.calls[0][3] is True
+
+
+def test_lecture_capture_choice_reports_sign_in_and_skips_without_url():
+    choice, note = asyncio.run(_lv._choice_from_lecture_capture(_CaptureClient({}, "canvas_sign_in_required"), _capture_target(), max_height_px=720))
+    assert choice is None and note == "canvas_sign_in_required"
+    choice, note = asyncio.run(_lv._choice_from_lecture_capture(_CaptureClient({}), _capture_target(record={}), max_height_px=720))
+    assert choice is None and note == ""
+
+
+def test_lecture_capture_url_from_library(monkeypatch):
+    monkeypatch.delenv("UNISYNC_LECTURE_CAPTURE_URL", raising=False)
+    libs = [{"echo360_course_id": "sec", "canvas_course_id": "241246"}, {"echo360_course_id": "other", "lecture_capture_url": "https://x/y"}]
+    assert _lv._lecture_capture_url(libs, "sec").endswith("/courses/241246/external_tools/701")
+    assert _lv._lecture_capture_url(libs, "other") == "https://x/y"
+    assert _lv._lecture_capture_url(libs, "none") == ""

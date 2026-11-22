@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 from urllib.parse import quote, urljoin, urlparse, urlunparse
 
+from unisync.services.sync import lecture_video_feeds as feeds
 from unisync.services.sync.echo360_ingest import lesson_stem
 from unisync.services.sync.echo360_links import _PLACEMENT_IDS, classroom_url
 
@@ -46,6 +47,10 @@ logger = logging.getLogger(__name__)
 _HOST = "https://echo360.net.au"
 _MAX_HEIGHT_DEFAULT = 720
 _MAX_BYTES_DEFAULT = 1610612736  # 1.5 GiB
+# Echo360 courses here play a ~15 s copyright/disclaimer clip before the lecture.
+# Anything shorter than this is flagged instead of being reported as the lecture.
+_MIN_SECONDS_DEFAULT = 120
+_ISO_DURATION = re.compile(r"^P(?:\d+D)?T?(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$", re.IGNORECASE)
 _ALLOWED_SUFFIXES = ("echo360.net.au", "amazonaws.com", "cloudfront.net")
 _STREAM_URL = re.compile(r"https://[^\s\"'\\<>]+?\.(?:m3u8|mp4|m4s|mpd)", re.IGNORECASE)
 _HEIGHT = re.compile(r"(\d{3,4})p", re.IGNORECASE)
@@ -59,7 +64,10 @@ _EMPTY_VIDEO = {
     "video_filepath": "",
     "video_bytes": 0,
     "video_quality": "",
+    "video_duration_seconds": 0,
 }
+# Statuses whose file stays on disk and is reported by path.
+_KEEP_PATH = {"downloaded", "skipped", "suspicious_short"}
 
 
 class DownloadError(Exception):
@@ -93,6 +101,8 @@ class LaunchResult:
     media_id: str = ""
     status: str = ""
     reason: str = ""
+    # player-properties JSON bodies the player fetched during the launch.
+    properties: list[Any] = field(default_factory=list)
 
 
 class MediaClient(Protocol):
@@ -116,6 +126,13 @@ class MediaChoice:
     audio_url: str = ""
     height: int = 0
     label: str = ""
+    duration: float = 0.0
+    media_id: str = ""
+    # Video feeds by role (``{"screen": 1, "camera": 2}``) for two-feed lectures.
+    roles: dict[str, int] = field(default_factory=dict)
+    # Signed file URL per Echo360 source, when Echo360 handed them out directly
+    # (Canvas-only lessons). Kept in memory only.
+    feed_urls: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -150,6 +167,62 @@ def max_height() -> int:
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
     return _MAX_HEIGHT_DEFAULT
+
+
+def min_seconds() -> int:
+    raw = os.environ.get("UNISYNC_LECTURE_VIDEO_MIN_SECONDS", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return _MIN_SECONDS_DEFAULT
+
+
+def parse_iso_duration(value: object) -> float:
+    """Seconds from an ISO-8601 duration such as ``PT982.867S``; 0 when unknown."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = _ISO_DURATION.match(str(value or "").strip())
+    if not match or not any(match.groups()):
+        return 0.0
+    hours, minutes, seconds = (float(part or 0) for part in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def sign_with_source_query(uri: str, root: Mapping[str, Any]) -> str:
+    """Attach the CloudFront query Echo360 publishes in ``sourceQueryStrings``.
+
+    player-properties lists CDN URIs that carry only tracking parameters
+    (``x-act``, ``x-mid`` ...). The player swaps that query for the CloudFront
+    one (``Policy``/``Signature``/``Key-Pair-Id``) whose ``uriPattern`` matches
+    the bare URI. Without the swap the CDN answers 403.
+    """
+    if not uri:
+        return uri
+    bare = urlunparse(urlparse(uri)._replace(query="", fragment=""))
+    block = root.get("sourceQueryStrings")
+    entries = block.get("queryStrings") if isinstance(block, Mapping) else None
+    for entry in entries or []:
+        if not isinstance(entry, Mapping):
+            continue
+        pattern = str(entry.get("uriPattern") or "")
+        query = next(
+            (str(v) for k, v in entry.items() if k != "uriPattern" and isinstance(v, str) and v.strip()),
+            "",
+        )
+        try:
+            matched = bool(pattern) and (re.match(pattern, bare) is not None or re.match(pattern, uri) is not None)
+        except re.error:
+            matched = False
+        if matched and query:
+            return f"{bare}?{query.lstrip('?')}"
+    return uri
+
+
+def payload_duration(payload: Any) -> float:
+    root = _payload_root(payload)
+    playable = root.get("playableAudioVideo")
+    if isinstance(playable, Mapping):
+        return parse_iso_duration(playable.get("duration"))
+    return parse_iso_duration(root.get("duration"))
 
 
 def max_bytes() -> int:
@@ -287,19 +360,29 @@ def choose_playable(payload: Any, *, max_height_px: int) -> MediaChoice | None:
 
     playable = root.get("playableAudioVideo")
     medias = playable.get("playableMedias") if isinstance(playable, Mapping) else None
+    duration = payload_duration(payload)
+    media_id = str(playable.get("mediaId") or "") if isinstance(playable, Mapping) else ""
+    video_only: set[int] = set()
     for item in medias or []:
         if not isinstance(item, Mapping) or _is_audio_only(item):
             continue
-        uri = str(item.get("uri") or item.get("url") or "").strip()
+        uri = sign_with_source_query(str(item.get("uri") or item.get("url") or "").strip(), root)
         if not uri or not is_allowed_media_url(uri):
             continue
         kind = "hls" if item.get("isHls") else ""
+        tracks = item.get("trackType") or item.get("trackTypes") or []
+        names = {str(track).lower() for track in ([tracks] if isinstance(tracks, str) else tracks)}
+        if names and "audio" not in names:
+            # A video-only rendition (``s1_v``) has no sound; keep it as a last resort.
+            video_only.add(len(candidates))
         candidates.append(
             MediaChoice(
                 container=container_of(uri, kind),
                 url=uri,
                 height=_height_of(item),
                 label=str(item.get("label") or ""),
+                duration=duration,
+                media_id=media_id,
             )
         )
 
@@ -308,24 +391,27 @@ def choose_playable(payload: Any, *, max_height_px: int) -> MediaChoice | None:
         for item in files:
             if not isinstance(item, Mapping):
                 continue
-            uri = str(item.get("s3Url") or item.get("url") or "").strip()
+            uri = sign_with_source_query(str(item.get("s3Url") or item.get("url") or "").strip(), root)
             if uri and is_allowed_media_url(uri):
-                candidates.append(MediaChoice(container=container_of(uri), url=uri, height=_height_of(item)))
+                candidates.append(
+                    MediaChoice(container=container_of(uri), url=uri, height=_height_of(item), duration=duration, media_id=media_id)
+                )
 
     manifests = root.get("manifests")
     if isinstance(manifests, list):
         for item in manifests:
             if not isinstance(item, Mapping):
                 continue
-            uri = str(item.get("uri") or "").strip()
+            uri = sign_with_source_query(str(item.get("uri") or "").strip(), root)
             if uri and is_allowed_media_url(uri):
-                candidates.append(MediaChoice(container="hls", url=uri))
+                candidates.append(MediaChoice(container="hls", url=uri, duration=duration, media_id=media_id))
 
     if not candidates:
         return None
 
-    def rank(pair: tuple[int, MediaChoice]) -> tuple[int, int, int]:
+    def rank(pair: tuple[int, MediaChoice]) -> tuple[int, int, int, int]:
         index, choice = pair
+        silent = 1 if index in video_only else 0
         if choice.height and choice.height <= max_height_px:
             fit = max_height_px - choice.height
         elif choice.height:
@@ -333,9 +419,35 @@ def choose_playable(payload: Any, *, max_height_px: int) -> MediaChoice | None:
         else:
             fit = 800 + abs(index - (len(candidates) // 2))
         container_penalty = {"mp4": 0, "m4s": 5, "hls": 20, "dash": 40}.get(choice.container, 60)
-        return (fit, container_penalty, index)
+        return (silent, fit, container_penalty, index)
 
-    return min(enumerate(candidates), key=rank)[1]
+    best = min(enumerate(candidates), key=rank)[1]
+    best.roles = feeds.assign_roles(root, feeds.video_sources(root))
+    return best
+
+
+def choose_main_lecture(payloads: list[Any], *, max_height_px: int) -> MediaChoice | None:
+    """Pick the lecture among every media the player loaded.
+
+    The LTI player loads a short disclaimer/intro media before the lecture.
+    Each media has its own player-properties with a duration; the longest one
+    is the lecture. A media with no duration ranks after ones that have one.
+    """
+    best: MediaChoice | None = None
+    for payload in payloads or []:
+        choice = choose_playable(payload, max_height_px=max_height_px)
+        if choice is None:
+            continue
+        if best is None or choice.duration > best.duration:
+            best = choice
+    if best is not None:
+        skipped = [
+            round(payload_duration(p)) for p in payloads
+            if payload_duration(p) and payload_duration(p) < best.duration
+        ]
+        if skipped:
+            logger.info("Skipped shorter pre-roll media (%s s); lecture is %d s", skipped, round(best.duration))
+    return best
 
 
 def parse_variants(playlist: str, base_url: str) -> list[tuple[str, int, int]]:
@@ -465,6 +577,33 @@ def _library_text_for_canvas(libraries: list[Mapping[str, Any]], canvas_id: str)
     return " ".join(chunks)
 
 
+def _library_name(libraries: list[Mapping[str, Any]], *, section_id: str = "", canvas_id: str = "") -> str:
+    for lib in libraries:
+        if section_id and str(lib.get("echo360_course_id") or "") == section_id:
+            return str(lib.get("kb_name") or lib.get("name") or "")
+        if canvas_id and str(lib.get("canvas_course_id") or "") == canvas_id:
+            return str(lib.get("kb_name") or lib.get("name") or "")
+    return ""
+
+
+_LECTURE_CAPTURE_URL = "https://canvas.lms.unimelb.edu.au/courses/{cid}/external_tools/701"
+
+
+def _lecture_capture_url(libraries: list[Mapping[str, Any]], section_id: str) -> str:
+    """Canvas Lecture Capture page that holds an Echo360 section's session."""
+    for lib in libraries:
+        if str(lib.get("echo360_course_id") or "") != section_id:
+            continue
+        url = str(lib.get("lecture_capture_url") or "")
+        if url:
+            return url
+        cid = str(lib.get("canvas_course_id") or "")
+        if cid.isdigit():
+            template = os.environ.get("UNISYNC_LECTURE_CAPTURE_URL", _LECTURE_CAPTURE_URL)
+            return template.replace("{cid}", cid)
+    return ""
+
+
 def _lesson_inner(item: Mapping[str, Any]) -> Mapping[str, Any]:
     lesson = item.get("lesson") or {}
     if isinstance(lesson, Mapping) and isinstance(lesson.get("lesson"), Mapping):
@@ -509,8 +648,11 @@ def select_targets(
 
     for section in sections:
         section_id = str(section.get("sectionId") or section.get("id") or "")
-        course_name = str(section.get("courseName") or section.get("name") or section_id)
+        course_name = str(
+            section.get("courseName") or section.get("name") or _library_name(libraries, section_id=section_id) or section_id
+        )
         extra = _library_text_for_section(libraries, section_id)
+        capture_url = _lecture_capture_url(libraries, section_id)
         if not _course_ok(course, section_id, course_name, section.get("name"), extra):
             continue
         for item in section.get("syllabus") or []:
@@ -540,6 +682,7 @@ def select_targets(
                     page_url=page,
                     recording_url=page,
                     source="echo360_course",
+                    record={"lecture_capture_url": capture_url} if capture_url else {},
                 )
             )
 
@@ -552,6 +695,7 @@ def select_targets(
             if not isinstance(items, list):
                 continue
             lib_text = _library_text_for_canvas(libraries, str(canvas_id))
+            embed_course = _library_name(libraries, canvas_id=str(canvas_id))
             for record in items:
                 if not isinstance(record, Mapping):
                     continue
@@ -579,7 +723,7 @@ def select_targets(
                         lesson_id=lesson_id,
                         title=title,
                         course_id=str(canvas_id),
-                        course_name=title,
+                        course_name=embed_course or title,
                         date="",
                         kind=kind or "unplayable_lti",
                         media_id=media_id,
@@ -609,11 +753,17 @@ def _video_dir(data_root: Path, target: VideoTarget) -> Path:
 
 
 def _existing_video(directory: Path, stem: str) -> Path | None:
-    for ext in (".mp4", ".m4s", ".ts"):
+    for ext in (".pip.mp4", ".screen.mp4", ".mp4", ".m4s", ".ts"):
         path = directory / f"{stem}{ext}"
         if path.is_file() and path.stat().st_size > 0:
             return path
     return None
+
+
+def _too_short(path: Path) -> bool:
+    floor = min_seconds()
+    seconds = probe_duration(path) if floor else 0.0
+    return bool(seconds) and seconds < floor
 
 
 def _same_lesson(item: Any, lesson_id: str) -> bool:
@@ -632,14 +782,19 @@ def _same_lesson(item: Any, lesson_id: str) -> bool:
     return lesson_id in candidates or stem in candidates
 
 
-def _video_metadata(target: VideoTarget, *, status: str, path: Path | None, nbytes: int, quality: str, error: str) -> dict[str, Any]:
-    keep = status in {"downloaded", "skipped"} and path is not None
+def _video_metadata(
+    target: VideoTarget, *, status: str, path: Path | None, nbytes: int, quality: str, error: str, duration: float = 0.0,
+    extras: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    keep = status in _KEEP_PATH and path is not None
     return {
+        **(dict(extras or {}) if keep else {}),
         "lesson_id": target.lesson_id,
         "video_status": status,
         "video_filepath": str(path) if keep else "",
         "video_bytes": nbytes if keep else 0,
         "video_quality": quality,
+        "video_duration_seconds": round(duration) if keep and duration else 0,
         "video_error": error,
     }
 
@@ -653,9 +808,13 @@ def record_video_result(
     nbytes: int,
     quality: str,
     error: str = "",
+    duration: float = 0.0,
+    extras: Mapping[str, str] | None = None,
 ) -> None:
     """Store video status on the lecture row. The signed media URL is not stored."""
-    extra = _video_metadata(target, status=status, path=path, nbytes=nbytes, quality=quality, error=error)
+    extra = _video_metadata(
+        target, status=status, path=path, nbytes=nbytes, quality=quality, error=error, duration=duration, extras=extras
+    )
     for item in registry.list_all("echo360"):
         if _same_lesson(item, target.lesson_id):
             registry.update_metadata(item.key, extra, auto_flush=False)
@@ -685,9 +844,13 @@ def _result(
     nbytes: int = 0,
     quality: str = "",
     error: str = "",
+    duration: float = 0.0,
+    extras: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     keep = status in {"downloaded", "skipped"} and path is not None
+    kept_path = status in _KEEP_PATH and path is not None
     return {
+        **(dict(extras or {}) if kept_path else {}),
         "lesson_id": target.lesson_id,
         "title": target.title,
         "course_id": target.course_id,
@@ -696,14 +859,15 @@ def _result(
         "recording_url_kind": target.kind,
         "video_status": status,
         "video_downloaded": keep,
-        "video_filepath": str(path) if keep else "",
-        "video_bytes": nbytes if keep else 0,
+        "video_filepath": str(path) if kept_path else "",
+        "video_bytes": nbytes if kept_path else 0,
         "video_quality": quality,
+        "video_duration_seconds": round(duration) if kept_path and duration else 0,
         "video_error": error,
     }
 
 
-def _fields_from_row(item: Mapping[str, Any]) -> dict[str, Any]:
+def _fields_from_row_base(item: Mapping[str, Any]) -> dict[str, Any]:
     meta = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
     status = str(meta.get("video_status") or "")
     path_text = str(meta.get("video_filepath") or "")
@@ -721,6 +885,16 @@ def _fields_from_row(item: Mapping[str, Any]) -> dict[str, Any]:
             "video_filepath": str(path),
             "video_bytes": path.stat().st_size if path else 0,
             "video_quality": str(meta.get("video_quality") or ""),
+            "video_duration_seconds": int(meta.get("video_duration_seconds") or 0),
+        }
+    if status == "suspicious_short" and exists:
+        return {
+            "video_downloaded": False,
+            "video_status": status,
+            "video_filepath": str(path),
+            "video_bytes": path.stat().st_size if path else 0,
+            "video_quality": str(meta.get("video_quality") or ""),
+            "video_duration_seconds": int(meta.get("video_duration_seconds") or 0),
         }
     if status == "downloaded" and not exists:
         status = "missing_file"
@@ -730,7 +904,27 @@ def _fields_from_row(item: Mapping[str, Any]) -> dict[str, Any]:
         "video_filepath": "",
         "video_bytes": 0,
         "video_quality": str(meta.get("video_quality") or ""),
+        "video_duration_seconds": 0,
     }
+
+
+_FEED_KEYS = ("video_screen_filepath", "video_camera_filepath", "video_pip_filepath")
+
+
+def _fields_from_row(item: Mapping[str, Any]) -> dict[str, Any]:
+    fields = _fields_from_row_base(item)
+    meta = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+    if fields.get("video_filepath"):
+        for key in _FEED_KEYS:
+            value = str(meta.get(key) or "")
+            if value and Path(value).is_file():
+                fields[key] = value
+        if meta.get("video_feeds"):
+            fields["video_feeds"] = int(str(meta.get("video_feeds")) or 0)
+        for key in ("video_pip_encoder", "video_pip_crop"):
+            if meta.get(key) and fields.get("video_pip_filepath"):
+                fields[key] = str(meta[key])
+    return fields
 
 
 def lookup_video_status(data_root: Path, *idents: str) -> dict[str, Any]:
@@ -831,7 +1025,10 @@ async def prefer_progressive(
     if pool:
         # Known sizes: highest quality that fit (lower rank). Unknown sizes: SD.
         pick = min(pool, key=lambda item: item[0]) if known else max(pool, key=lambda item: item[0])
-        return MediaChoice(container=container_of(pick[1]), url=pick[1], label="hd" if pick[0] < 2 else "sd")
+        return MediaChoice(
+            container=container_of(pick[1]), url=pick[1], label="hd" if pick[0] < 2 else "sd",
+            duration=choice.duration, media_id=choice.media_id, roles=dict(choice.roles),
+        )
 
     video_url = ""
     audio_url = ""
@@ -847,7 +1044,10 @@ async def prefer_progressive(
             break
     if video_url and audio_url and shutil.which("ffmpeg"):
         label = "hd" if "q1" in video_url else "sd"
-        return MediaChoice(container="mux", url=video_url, audio_url=audio_url, label=label)
+        return MediaChoice(
+            container="mux", url=video_url, audio_url=audio_url, label=label,
+            duration=choice.duration, media_id=choice.media_id, roles=dict(choice.roles),
+        )
     return choice
 
 
@@ -858,6 +1058,7 @@ async def _choice_from_properties(
     max_height_px: int,
 ) -> tuple[MediaChoice | None, str]:
     last = ""
+    payloads: list[Any] = []
     for url in player_property_urls(target):
         try:
             response = await client.get(url)
@@ -875,11 +1076,42 @@ async def _choice_from_properties(
         except ValueError:
             last = public_failure(response.status, url)
             continue
-        choice = choose_playable(payload, max_height_px=max_height_px)
-        if choice is not None:
-            return choice, ""
+        if choose_playable(payload, max_height_px=max_height_px) is not None:
+            payloads.append(payload)
+            continue
         last = "player-properties had no video"
+    choice = choose_main_lecture(payloads, max_height_px=max_height_px)
+    if choice is not None:
+        return choice, ""
     return None, last
+
+
+async def _choice_from_browser(
+    client: MediaClient,
+    page_url: str,
+    *,
+    max_height_px: int,
+) -> tuple[MediaChoice | None, str]:
+    """Open the player page in the (muted) browser and read what the player loads.
+
+    Echo360 answers player-properties only inside the player's own session
+    (a public page sets an anonymous one; a lesson page needs the Echo360
+    login), so a plain HTTP fetch gets 403/404 where the page itself works.
+    """
+    capture = getattr(client, "capture_properties", None)
+    if capture is None or not page_url or not is_allowed_media_url(page_url):
+        return None, ""
+    try:
+        payloads = await capture(page_url)
+    except Exception:
+        return None, public_failure(0, page_url)
+    choice = choose_main_lecture(list(payloads or []), max_height_px=max_height_px)
+    if choice is None:
+        note = str(getattr(client, "last_capture_note", "") or "")
+        if note:
+            return None, note
+        return None, "player page loaded no playable media" if payloads else "player page loaded no player-properties"
+    return choice, ""
 
 
 async def _choice_from_html(client: MediaClient, page_url: str) -> tuple[MediaChoice | None, str]:
@@ -906,6 +1138,42 @@ def _choice_from_launch(launch: LaunchResult) -> MediaChoice | None:
     return None
 
 
+async def _choice_from_lecture_capture(
+    client: MediaClient, target: VideoTarget, *, max_height_px: int
+) -> tuple[MediaChoice | None, str]:
+    """Feed files of a Canvas-only lesson, listed from inside the Lecture Capture frame."""
+    files_for = getattr(client, "lesson_files", None)
+    if files_for is None or not target.media_id or not target.record.get("lecture_capture_url"):
+        return None, ""
+    try:
+        found = await files_for(
+            target.record, target.media_id, target.lesson_id, full=not max_height_px or max_height_px >= 720
+        )
+    except Exception:
+        logger.info("Lecture Capture lookup failed", exc_info=False)
+        return None, "lecture_capture_error"
+    files = {int(k): str(v) for k, v in (found.get("files") or {}).items() if v and is_allowed_media_url(str(v))}
+    if found.get("muted") is not None:
+        logger.info("Lecture Capture player muted: %s", found.get("muted"))
+    if not files:
+        return None, str(found.get("note") or "lecture_capture_no_files")
+    sources = sorted(files)
+    main = sources[0]
+    labels = found.get("labels") or {}
+    url = files[main]
+    return (
+        MediaChoice(
+            container=container_of(url),
+            url=url,
+            label="hd" if str(labels.get(main, "")).lower() == "full" else "sd",
+            media_id=target.media_id,
+            roles=feeds.assign_roles({}, sources) if len(sources) >= 2 else {},
+            feed_urls=files,
+        ),
+        "",
+    )
+
+
 async def resolve_media(
     target: VideoTarget,
     client: MediaClient,
@@ -915,6 +1183,10 @@ async def resolve_media(
 ) -> tuple[MediaChoice | None, str]:
     """Resolve one recording to a downloadable URL. The URL is not returned to callers."""
     note = ""
+    if target.kind == "echo360_lesson":
+        capture_choice, note = await _choice_from_lecture_capture(client, target, max_height_px=max_height_px)
+        if capture_choice is not None:
+            return capture_choice, ""
     if target.kind in {"canvas_embed_page", "unplayable_lti"} or (
         target.source == "canvas_embed" and target.kind != "echo360_public"
     ):
@@ -922,7 +1194,9 @@ async def resolve_media(
             launch = await client.launch(target.record)
         except Exception:
             launch = LaunchResult(status="error", reason="browser_unavailable")
-        choice = _choice_from_launch(launch)
+        choice = choose_main_lecture(list(launch.properties or []), max_height_px=max_height_px)
+        if choice is None:
+            choice = _choice_from_launch(launch)
         if choice is None and launch.media_id and launch.media_id.lower() not in _PLACEMENT_IDS:
             target = VideoTarget(**{**target.__dict__, "media_id": launch.media_id})
         if choice is not None:
@@ -932,10 +1206,43 @@ async def resolve_media(
     choice, properties_note = await _choice_from_properties(client, target, max_height_px=max_height_px)
     if choice is not None:
         return await prefer_progressive(choice, client, max_size=max_size), ""
+    browser_choice, browser_note = await _choice_from_browser(client, target.page_url, max_height_px=max_height_px)
+    if browser_choice is not None:
+        return await prefer_progressive(browser_choice, client, max_size=max_size), ""
     html_choice, html_note = await _choice_from_html(client, target.page_url)
     if html_choice is not None:
         return await prefer_progressive(html_choice, client, max_size=max_size), ""
-    return None, note or properties_note or html_note or "no_video"
+    return None, note or browser_note or properties_note or html_note or "no_video"
+
+
+def probe_duration(path: Path) -> float:
+    """Container duration in seconds via ffprobe; 0 when ffprobe is unavailable."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0.0
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        return float((out.stdout or "0").strip() or 0)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _set_aside_short(path: Path) -> None:
+    """Rename a too-short earlier file so a real download can take its name. Nothing is deleted."""
+    target = path.with_name(f"{path.stem}.short{path.suffix}")
+    index = 1
+    while target.exists():
+        target = path.with_name(f"{path.stem}.short{index}{path.suffix}")
+        index += 1
+    try:
+        path.replace(target)
+    except OSError:
+        pass
 
 
 def _ffmpeg_argv(ffmpeg: str, inputs: list[str], dest: Path, headers: dict[str, str]) -> list[str]:
@@ -959,6 +1266,7 @@ async def _run_ffmpeg(argv: list[str]) -> None:
         *argv,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
+        **feeds.low_priority_kwargs(),
     )
     await proc.wait()
     if proc.returncode != 0:
@@ -1064,6 +1372,157 @@ async def _download_hls(
         shutil.rmtree(temp, ignore_errors=True)
 
 
+async def _fetch_choice(
+    choice: MediaChoice,
+    *,
+    client: MediaClient,
+    dest_dir: Path,
+    stem: str,
+    header_map: dict[str, str],
+    max_height_px: int,
+    max_size: int,
+) -> tuple[Path, int, str]:
+    """Download one choice to ``dest_dir/<stem>.<ext>``. Raises ``DownloadError``."""
+    if choice.container == "dash":
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise DownloadError("DASH stream needs ffmpeg, which is not installed")
+        dest = dest_dir / f"{stem}.mp4"
+        part = dest.with_name(dest.name + ".part")
+        await _run_ffmpeg(_ffmpeg_argv(ffmpeg, [choice.url], part, header_map))
+        part.replace(dest)
+        path, nbytes, quality = dest, dest.stat().st_size, "dash ffmpeg"
+    elif choice.container == "mux":
+        video = dest_dir / f".{stem}.video.part"
+        audio = dest_dir / f".{stem}.audio.part"
+        await _download_bytes(client, choice.url, video, max_size=max_size)
+        await _download_bytes(client, choice.audio_url, audio, max_size=max_size)
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise DownloadError("separate audio and video need ffmpeg")
+        dest = dest_dir / f"{stem}.mp4"
+        part = dest.with_name(dest.name + ".part")
+        await _run_ffmpeg(_ffmpeg_argv(ffmpeg, [str(video), str(audio)], part, {}))
+        video.unlink(missing_ok=True)
+        audio.unlink(missing_ok=True)
+        part.replace(dest)
+        path, nbytes, quality = dest, dest.stat().st_size, f"mux {choice.label}".strip()
+    elif choice.container == "hls":
+        dest = dest_dir / f"{stem}.mp4"
+        path, nbytes, quality = await _download_hls(
+            client,
+            choice.url,
+            dest,
+            max_height_px=max_height_px,
+            max_size=max_size,
+            headers=header_map,
+        )
+    else:
+        ext = ".m4s" if choice.container == "m4s" else ".mp4"
+        dest = dest_dir / f"{stem}{ext}"
+        nbytes = await _download_bytes(client, choice.url, dest, max_size=max_size)
+        path, quality = dest, choice.label or choice.container
+    return path, nbytes, quality
+
+
+async def _feed_choice(choice: MediaChoice, client: MediaClient, source: int, max_size: int) -> MediaChoice | None:
+    """Downloadable file(s) for one Echo360 source next to the lecture's playlist."""
+    if choice.feed_urls.get(source):
+        url = choice.feed_urls[source]
+        label = "hd" if feeds.source_of_url(url) and "/hd" in urlparse(url).path else "sd"
+        return MediaChoice(container=container_of(url), url=url, label=label, duration=choice.duration, media_id=choice.media_id)
+    muxed, video_names, audio_names = feeds.feed_file_names(source)
+    for name in muxed:
+        url = sibling_url(choice.url, name)
+        if await _probe_ok(client, url, max_size) is not None:
+            label = "hd" if name.startswith("hd") else "sd"
+            return MediaChoice(container=container_of(url), url=url, label=label, duration=choice.duration, media_id=choice.media_id)
+    video_url = ""
+    for name in video_names:
+        url = sibling_url(choice.url, name)
+        if await _probe_ok(client, url, max_size) is not None:
+            video_url = url
+            break
+    audio_url = ""
+    for name in audio_names:
+        url = sibling_url(choice.url, name)
+        if await _probe_ok(client, url, max_size) is not None:
+            audio_url = url
+            break
+    if video_url and audio_url and shutil.which("ffmpeg"):
+        label = "hd" if "q1" in video_url else "sd"
+        return MediaChoice(container="mux", url=video_url, audio_url=audio_url, label=label, duration=choice.duration, media_id=choice.media_id)
+    if container_of(choice.url) == "hls":
+        return MediaChoice(container="hls", url=sibling_url(choice.url, f"s{source}_av.m3u8"), duration=choice.duration, media_id=choice.media_id)
+    return None
+
+
+async def _store_feeds(
+    choice: MediaChoice,
+    main_path: Path,
+    main_seconds: float,
+    *,
+    client: MediaClient,
+    dest_dir: Path,
+    stem: str,
+    header_map: dict[str, str],
+    max_height_px: int,
+    max_size: int,
+) -> tuple[Path, dict[str, str]]:
+    """Save the second feed and the picture-in-picture file. Returns (primary file, extra paths).
+
+    The file already downloaded is one feed; it is renamed ``<stem>.<role>.mp4``.
+    A feed whose length does not match the lecture (a pre-roll) is set aside.
+    """
+    main_source = feeds.source_of_url(choice.url) or min(choice.roles.values())
+    role_of = {source: role for role, source in choice.roles.items()}
+    main_role = role_of.get(main_source, "screen")
+    extras: dict[str, str] = {}
+    named = feeds.feed_path(dest_dir, stem, main_role)
+    try:
+        main_path.replace(named)
+    except OSError:
+        return main_path, {}
+    main_path = named
+    extras[f"video_{main_role}_filepath"] = str(main_path)
+    for role, source in choice.roles.items():
+        if source == main_source or role not in {"screen", "camera"}:
+            continue
+        feed = await _feed_choice(choice, client, source, max_size)
+        if feed is None:
+            logger.info("No downloadable %s feed beside the lecture playlist", role)
+            continue
+        try:
+            path, _, _ = await _fetch_choice(
+                feed, client=client, dest_dir=dest_dir, stem=f"{stem}.{role}", header_map=header_map,
+                max_height_px=max_height_px, max_size=max_size,
+            )
+        except DownloadError as exc:
+            logger.info("%s feed not saved (%s)", role, exc)
+            continue
+        seconds = probe_duration(path)
+        if not feeds.durations_match(main_seconds, seconds):
+            logger.info("%s feed is %d s, lecture is %d s; set aside", role, round(seconds), round(main_seconds))
+            _set_aside_short(path)
+            continue
+        extras[f"video_{role}_filepath"] = str(path)
+    primary = main_path
+    screen, camera = extras.get("video_screen_filepath"), extras.get("video_camera_filepath")
+    if screen and camera:
+        pip_notes: dict[str, str] = {}
+        pip, how = await feeds.build_pip(Path(screen), Path(camera), feeds.pip_path(dest_dir, stem), notes=pip_notes)
+        if pip is not None:
+            extras["video_pip_filepath"] = str(pip)
+            extras["video_pip_encoder"] = how
+            if pip_notes.get("crop"):
+                extras["video_pip_crop"] = pip_notes["crop"]
+            primary = pip
+        else:
+            logger.info("Picture-in-picture not built (%s)", how)
+    extras["video_feeds"] = str(sum(1 for key in ("video_screen_filepath", "video_camera_filepath") if key in extras))
+    return primary, extras
+
+
 async def _store_choice(
     target: VideoTarget,
     choice: MediaChoice,
@@ -1077,6 +1536,9 @@ async def _store_choice(
 ) -> dict[str, Any]:
     stem = lesson_stem(target.lesson_id) or "lecture"
     present = _existing_video(dest_dir, stem)
+    if present is not None and _too_short(present):
+        _set_aside_short(present)
+        present = None
     if present is not None:
         record_video_result(
             registry,
@@ -1085,6 +1547,7 @@ async def _store_choice(
             path=present,
             nbytes=present.stat().st_size,
             quality=choice.label or choice.container,
+            duration=probe_duration(present),
         )
         return _result(
             target,
@@ -1092,56 +1555,45 @@ async def _store_choice(
             path=present,
             nbytes=present.stat().st_size,
             quality=choice.label or choice.container,
+            duration=probe_duration(present),
         )
     dest_dir.mkdir(parents=True, exist_ok=True)
     header_map = dict(headers or {})
     try:
         if not header_map:
             header_map = dict(await client.auth_headers(choice.url))
-        if choice.container == "dash":
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                raise DownloadError("DASH stream needs ffmpeg, which is not installed")
-            dest = dest_dir / f"{stem}.mp4"
-            part = dest.with_name(dest.name + ".part")
-            await _run_ffmpeg(_ffmpeg_argv(ffmpeg, [choice.url], part, header_map))
-            part.replace(dest)
-            path, nbytes, quality = dest, dest.stat().st_size, "dash ffmpeg"
-        elif choice.container == "mux":
-            video = dest_dir / f".{stem}.video.part"
-            audio = dest_dir / f".{stem}.audio.part"
-            await _download_bytes(client, choice.url, video, max_size=max_size)
-            await _download_bytes(client, choice.audio_url, audio, max_size=max_size)
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                raise DownloadError("separate audio and video need ffmpeg")
-            dest = dest_dir / f"{stem}.mp4"
-            part = dest.with_name(dest.name + ".part")
-            await _run_ffmpeg(_ffmpeg_argv(ffmpeg, [str(video), str(audio)], part, {}))
-            video.unlink(missing_ok=True)
-            audio.unlink(missing_ok=True)
-            part.replace(dest)
-            path, nbytes, quality = dest, dest.stat().st_size, f"mux {choice.label}".strip()
-        elif choice.container == "hls":
-            dest = dest_dir / f"{stem}.mp4"
-            path, nbytes, quality = await _download_hls(
-                client,
-                choice.url,
-                dest,
-                max_height_px=max_height_px,
-                max_size=max_size,
-                headers=header_map,
-            )
-        else:
-            ext = ".m4s" if choice.container == "m4s" else ".mp4"
-            dest = dest_dir / f"{stem}{ext}"
-            nbytes = await _download_bytes(client, choice.url, dest, max_size=max_size)
-            path, quality = dest, choice.label or choice.container
+        path, nbytes, quality = await _fetch_choice(
+            choice, client=client, dest_dir=dest_dir, stem=stem, header_map=header_map,
+            max_height_px=max_height_px, max_size=max_size,
+        )
     except DownloadError as exc:
         message = str(exc)
         status = "too_large" if "larger than" in message else "needs_ffmpeg" if "ffmpeg" in message else "failed"
         record_video_result(registry, target, status=status, path=None, nbytes=0, quality="", error=message)
         return _result(target, status=status, error=message)
+    seconds = probe_duration(path) or choice.duration
+    floor = min_seconds()
+    if seconds and floor and seconds < floor:
+        message = (
+            f"saved file is only {round(seconds)} s long; this looks like the Echo360 "
+            "disclaimer/intro, not the lecture"
+        )
+        record_video_result(
+            registry, target, status="suspicious_short", path=path, nbytes=nbytes,
+            quality=quality, error=message, duration=seconds,
+        )
+        logger.warning("Lecture video %s flagged: %s", target.lesson_id[:80], message)
+        return _result(
+            target, status="suspicious_short", path=path, nbytes=nbytes,
+            quality=quality, error=message, duration=seconds,
+        )
+    extras: dict[str, str] = {}
+    if len(choice.roles) >= 2:
+        path, extras = await _store_feeds(
+            choice, path, seconds, client=client, dest_dir=dest_dir, stem=stem, header_map=header_map,
+            max_height_px=max_height_px, max_size=max_size,
+        )
+        nbytes = path.stat().st_size
     record_video_result(
         registry,
         target,
@@ -1149,14 +1601,17 @@ async def _store_choice(
         path=path,
         nbytes=nbytes,
         quality=quality,
+        duration=seconds,
+        extras=extras,
     )
     logger.info(
-        "Saved lecture video %s (%s, %d bytes)",
+        "Saved lecture video %s (%s, %d bytes, %d s)",
         target.lesson_id[:80],
         quality,
         nbytes,
+        round(seconds),
     )
-    return _result(target, status="downloaded", path=path, nbytes=nbytes, quality=quality)
+    return _result(target, status="downloaded", path=path, nbytes=nbytes, quality=quality, duration=seconds, extras=extras)
 
 
 async def download_one(
@@ -1172,6 +1627,9 @@ async def download_one(
     limit = max_bytes() if max_size is None else max_size
     dest_dir = _video_dir(data_root, target)
     present = _existing_video(dest_dir, lesson_stem(target.lesson_id) or "lecture")
+    if present is not None and _too_short(present):
+        _set_aside_short(present)
+        present = None
     if present is not None:
         record_video_result(
             registry,
@@ -1180,8 +1638,10 @@ async def download_one(
             path=present,
             nbytes=present.stat().st_size,
             quality="",
+            duration=probe_duration(present),
         )
-        return _result(target, status="skipped", path=present, nbytes=present.stat().st_size)
+        return _result(target, status="skipped", path=present, nbytes=present.stat().st_size,
+                       duration=probe_duration(present))
     choice, reason = await resolve_media(target, client, max_height_px=height, max_size=limit)
     if choice is None:
         record_video_result(registry, target, status="unavailable", path=None, nbytes=0, quality="", error=reason)
@@ -1229,6 +1689,11 @@ async def download_lectures(
         from unisync.core.download_registry import DownloadRegistry
 
         registry = DownloadRegistry(Path(data_root) / "downloads_manifest.json")
+    if not lecture.strip():
+        # Timetable slots with no recording ("COMP10001_2026_SM2 TH GM15") have
+        # no media id. Prefer real recordings when the course has any.
+        recorded = [t for t in targets if t.source != "echo360_course" or t.media_id]
+        targets = recorded or targets
     media_client = client or build_client()
     results: list[dict[str, Any]] = []
     for target in targets[: max(1, limit)]:
